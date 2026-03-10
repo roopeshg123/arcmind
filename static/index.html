@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arc Docs Assistant</title>
+  <style>
+    /* ------------------------------------------------------------------ reset */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #0f0f0f;
+      color: #ececec;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ---------------------------------------------------------------- header */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 24px;
+      background: #1a1a1a;
+      border-bottom: 1px solid #2e2e2e;
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: .02em; }
+    header h1 span { color: #7c8ff5; }
+
+    #status-badge {
+      font-size: .75rem;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-weight: 500;
+      transition: background .3s, color .3s;
+    }
+    #status-badge.ready    { background: #1a3a2a; color: #4caf88; border: 1px solid #2e6e4e; }
+    #status-badge.not_ready{ background: #3a1a1a; color: #cf7070; border: 1px solid #6e2e2e; }
+    #status-badge.checking { background: #2a2a2a; color: #888;    border: 1px solid #444;    }
+
+    /* --------------------------------------------------------------- toolbar */
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 24px;
+      background: #161616;
+      border-bottom: 1px solid #2a2a2a;
+      flex-shrink: 0;
+    }
+    #toolbar button {
+      font-size: .8rem;
+      padding: 6px 14px;
+      border-radius: 6px;
+      border: 1px solid #3e3e3e;
+      background: #252525;
+      color: #ccc;
+      cursor: pointer;
+      transition: background .2s, color .2s;
+    }
+    #toolbar button:hover { background: #333; color: #fff; }
+    #toolbar button.primary { background: #3b4fd8; border-color: #3b4fd8; color: #fff; }
+    #toolbar button.primary:hover { background: #4d62f0; }
+    #toolbar button:disabled { opacity: .4; cursor: not-allowed; }
+    #ingest-status { font-size: .78rem; color: #888; }
+
+    /* -------------------------------------------------------------- messages */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 28px 0;
+      scroll-behavior: smooth;
+    }
+    #messages::-webkit-scrollbar { width: 6px; }
+    #messages::-webkit-scrollbar-track { background: transparent; }
+    #messages::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
+    .msg-row {
+      display: flex;
+      padding: 6px 24px;
+      max-width: 860px;
+      margin: 0 auto;
+      width: 100%;
+      gap: 14px;
+      animation: fadeUp .2s ease;
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0);   }
+    }
+
+    .avatar {
+      width: 30px;
+      height: 30px;
+      border-radius: 6px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: .8rem;
+      font-weight: 700;
+      margin-top: 2px;
+    }
+    .avatar.user { background: #3b4fd8; color: #fff; }
+    .avatar.bot  { background: #2a2a3a; color: #7c8ff5; border: 1px solid #3a3a5a; }
+
+    .bubble {
+      flex: 1;
+      line-height: 1.65;
+      font-size: .925rem;
+    }
+    .bubble .name {
+      font-size: .72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 6px;
+    }
+    .msg-row.user .bubble .name { color: #7c8ff5; }
+    .msg-row.bot  .bubble .name { color: #4caf88; }
+
+    .bubble .text { color: #e0e0e0; white-space: pre-wrap; word-break: break-word; }
+    .bubble .text code {
+      background: #1e1e2e;
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: "Fira Code", "Cascadia Code", monospace;
+      font-size: .875em;
+      color: #c792ea;
+    }
+    .bubble .text pre {
+      background: #1e1e2e;
+      border: 1px solid #2e2e3e;
+      border-radius: 8px;
+      padding: 14px 16px;
+      overflow-x: auto;
+      margin: 10px 0;
+    }
+    .bubble .text pre code { background: none; padding: 0; color: inherit; }
+    .bubble .text ul, .bubble .text ol { padding-left: 20px; margin: 6px 0; }
+    .bubble .text li { margin: 3px 0; }
+    .bubble .text strong { color: #fff; }
+
+    /* sources */
+    .sources {
+      margin-top: 10px;
+      padding: 10px 14px;
+      background: #161626;
+      border: 1px solid #2a2a4a;
+      border-radius: 8px;
+      font-size: .78rem;
+    }
+    .sources .sources-title {
+      color: #7c8ff5;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .sources ul { padding-left: 16px; color: #aaa; }
+    .sources li { margin: 3px 0; }
+    .sources li span { color: #888; display: block; margin-top: 1px; font-size: .72rem; }
+
+    /* typing indicator */
+    .typing .dot {
+      display: inline-block;
+      width: 7px; height: 7px;
+      margin: 0 2px;
+      background: #555;
+      border-radius: 50%;
+      animation: bounce 1.2s infinite;
+    }
+    .typing .dot:nth-child(2) { animation-delay: .2s; }
+    .typing .dot:nth-child(3) { animation-delay: .4s; }
+    @keyframes bounce {
+      0%, 80%, 100% { transform: translateY(0); }
+      40%            { transform: translateY(-6px); }
+    }
+
+    /* empty state */
+    #empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      gap: 10px;
+      color: #444;
+      user-select: none;
+    }
+    #empty-state svg { opacity: .3; }
+    #empty-state p { font-size: .9rem; }
+
+    /* ----------------------------------------------------------------- input */
+    #input-area {
+      padding: 16px 24px 20px;
+      background: #161616;
+      border-top: 1px solid #2a2a2a;
+      flex-shrink: 0;
+    }
+    #input-form {
+      display: flex;
+      gap: 10px;
+      max-width: 860px;
+      margin: 0 auto;
+    }
+    #question-input {
+      flex: 1;
+      background: #222;
+      border: 1px solid #3a3a3a;
+      border-radius: 10px;
+      padding: 12px 16px;
+      color: #ececec;
+      font-size: .92rem;
+      resize: none;
+      height: 52px;
+      max-height: 160px;
+      overflow-y: auto;
+      line-height: 1.5;
+      transition: border-color .2s;
+      outline: none;
+    }
+    #question-input:focus { border-color: #4d62f0; }
+    #question-input::placeholder { color: #555; }
+
+    #send-btn {
+      background: #3b4fd8;
+      border: none;
+      border-radius: 10px;
+      padding: 0 18px;
+      cursor: pointer;
+      transition: background .2s, transform .1s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    #send-btn:hover:not(:disabled) { background: #4d62f0; }
+    #send-btn:active:not(:disabled) { transform: scale(.96); }
+    #send-btn:disabled { opacity: .35; cursor: not-allowed; }
+    #send-btn svg { fill: #fff; }
+
+    #input-hint { font-size: .72rem; color: #444; text-align: center; margin-top: 8px; }
+  </style>
+</head>
+<body>
+
+<!-- =========================================================== HEADER -->
+<header>
+  <h1>Arc Docs <span>Assistant</span></h1>
+  <span id="status-badge" class="checking">Checking…</span>
+</header>
+
+<!-- =========================================================== TOOLBAR -->
+<div id="toolbar">
+  <button id="ingest-btn" class="primary" onclick="triggerIngest()">⚡ Index Docs</button>
+  <button onclick="clearChat()">🗑 Clear Chat</button>
+  <span id="ingest-status"></span>
+</div>
+
+<!-- =========================================================== MESSAGES -->
+<div id="messages">
+  <div id="empty-state">
+    <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">
+      <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm0-4h-2V7h2v8z"/>
+    </svg>
+    <p>Index your docs then ask any question about your application.</p>
+  </div>
+</div>
+
+<!-- =========================================================== INPUT -->
+<div id="input-area">
+  <form id="input-form" onsubmit="sendMessage(event)">
+    <textarea
+      id="question-input"
+      placeholder="Ask anything about your Arc application…"
+      rows="1"
+      onkeydown="handleKey(event)"
+    ></textarea>
+    <button id="send-btn" type="submit" title="Send">
+      <svg width="20" height="20" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    </button>
+  </form>
+  <p id="input-hint">Press Enter to send &nbsp;·&nbsp; Shift+Enter for new line</p>
+</div>
+
+<script>
+  // ---------------------------------------------------------------- state
+  let chatHistory  = [];   // [{role, content}, …]
+  let isLoading    = false;
+
+  // ---------------------------------------------------------------- startup
+  window.addEventListener("DOMContentLoaded", checkStatus);
+
+  async function checkStatus() {
+    const badge = document.getElementById("status-badge");
+    try {
+      const res  = await fetch("/api/status");
+      const data = await res.json();
+      if (data.status === "ready") {
+        badge.className = "ready";
+        badge.textContent = `✓ Ready — ${data.vectors.toLocaleString()} vectors`;
+      } else {
+        badge.className = "not_ready";
+        badge.textContent = "✗ Not indexed";
+      }
+    } catch {
+      badge.className = "not_ready";
+      badge.textContent = "✗ Server offline";
+    }
+  }
+
+  // ---------------------------------------------------------------- ingest
+  async function triggerIngest() {
+    const btn    = document.getElementById("ingest-btn");
+    const status = document.getElementById("ingest-status");
+    btn.disabled = true;
+    status.textContent = "Indexing documentation…";
+    try {
+      const res  = await fetch("/api/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reset: true }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        status.textContent =
+          `✓ Indexed ${data.files_loaded} file(s) → ${data.vectors_stored} vectors`;
+        checkStatus();
+      } else {
+        status.textContent = `✗ ${data.detail}`;
+      }
+    } catch (e) {
+      status.textContent = "✗ Network error";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // ---------------------------------------------------------------- chat
+  function handleKey(e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      document.getElementById("input-form").requestSubmit();
+    }
+    // Auto-grow textarea
+    const ta = e.target;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 160) + "px";
+  }
+
+  async function sendMessage(e) {
+    e.preventDefault();
+    if (isLoading) return;
+
+    const input    = document.getElementById("question-input");
+    const question = input.value.trim();
+    if (!question) return;
+
+    input.value       = "";
+    input.style.height = "52px";
+
+    hideEmptyState();
+    appendMessage("user", question);
+    chatHistory.push({ role: "user", content: question });
+
+    const typingId = appendTyping();
+    isLoading      = true;
+    setInputEnabled(false);
+
+    try {
+      const res  = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question,
+          history: chatHistory.slice(0, -1),   // exclude the question we just added
+        }),
+      });
+
+      removeTyping(typingId);
+
+      if (!res.ok) {
+        const err = await res.json();
+        appendMessage("bot", `⚠️ ${err.detail || "An error occurred."}`);
+      } else {
+        const data = await res.json();
+        chatHistory.push({ role: "assistant", content: data.answer });
+        appendMessage("bot", data.answer, data.sources);
+      }
+    } catch {
+      removeTyping(typingId);
+      appendMessage("bot", "⚠️ Could not reach the server. Make sure the backend is running.");
+    } finally {
+      isLoading = false;
+      setInputEnabled(true);
+      document.getElementById("question-input").focus();
+    }
+  }
+
+  // ---------------------------------------------------------------- DOM helpers
+  function hideEmptyState() {
+    const es = document.getElementById("empty-state");
+    if (es) es.remove();
+  }
+
+  function appendMessage(role, text, sources = []) {
+    const container = document.getElementById("messages");
+    const row = document.createElement("div");
+    row.className = `msg-row ${role}`;
+
+    const avatar = document.createElement("div");
+    avatar.className = `avatar ${role === "user" ? "user" : "bot"}`;
+    avatar.textContent = role === "user" ? "U" : "AI";
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = role === "user" ? "You" : "Assistant";
+
+    const textDiv = document.createElement("div");
+    textDiv.className = "text";
+    textDiv.innerHTML = markdownToHtml(text);
+
+    bubble.appendChild(name);
+    bubble.appendChild(textDiv);
+
+    // Sources
+    if (sources && sources.length > 0) {
+      const srcBox = document.createElement("div");
+      srcBox.className = "sources";
+      srcBox.innerHTML = `<div class="sources-title">📄 Sources</div>`;
+      const ul = document.createElement("ul");
+      sources.forEach(s => {
+        const li = document.createElement("li");
+        li.innerHTML = `<strong>${escapeHtml(s.source)}</strong><span>${escapeHtml(s.content)}</span>`;
+        ul.appendChild(li);
+      });
+      srcBox.appendChild(ul);
+      bubble.appendChild(srcBox);
+    }
+
+    row.appendChild(avatar);
+    row.appendChild(bubble);
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+    return row;
+  }
+
+  function appendTyping() {
+    const id        = "typing-" + Date.now();
+    const container = document.getElementById("messages");
+    const row       = document.createElement("div");
+    row.className   = "msg-row bot";
+    row.id          = id;
+
+    const avatar = document.createElement("div");
+    avatar.className = "avatar bot";
+    avatar.textContent = "AI";
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.innerHTML = `
+      <div class="name">Assistant</div>
+      <div class="typing">
+        <span class="dot"></span>
+        <span class="dot"></span>
+        <span class="dot"></span>
+      </div>`;
+
+    row.appendChild(avatar);
+    row.appendChild(bubble);
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+    return id;
+  }
+
+  function removeTyping(id) {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  }
+
+  function setInputEnabled(enabled) {
+    document.getElementById("question-input").disabled = !enabled;
+    document.getElementById("send-btn").disabled       = !enabled;
+  }
+
+  function clearChat() {
+    chatHistory = [];
+    const container = document.getElementById("messages");
+    container.innerHTML = `
+      <div id="empty-state">
+        <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm0-4h-2V7h2v8z"/>
+        </svg>
+        <p>Index your docs then ask any question about your application.</p>
+      </div>`;
+  }
+
+  // ---------------------------------------------------------------- mini markdown renderer
+  function markdownToHtml(text) {
+    let html = escapeHtml(text);
+    // code blocks
+    html = html.replace(/```([\s\S]*?)```/g, (_, code) =>
+      `<pre><code>${code.trim()}</code></pre>`);
+    // inline code
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // bold
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // italic
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // headers
+    html = html.replace(/^### (.+)$/gm, '<strong>$1</strong>');
+    html = html.replace(/^## (.+)$/gm, '<strong>$1</strong>');
+    html = html.replace(/^# (.+)$/gm, '<strong>$1</strong>');
+    // unordered lists
+    html = html.replace(/^\s*[-*] (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/(<li>.*<\/li>(\n|$))+/g, m => `<ul>${m}</ul>`);
+    // ordered lists
+    html = html.replace(/^\s*\d+\. (.+)$/gm, '<li>$1</li>');
+    // line breaks
+    html = html.replace(/\n/g, '<br>');
+    return html;
+  }
+
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+</script>
+</body>
+</html>

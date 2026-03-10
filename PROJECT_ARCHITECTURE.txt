@@ -1,0 +1,791 @@
+================================================================================
+       ARC DOCS AI ASSISTANT — COMPLETE PROJECT ARCHITECTURE & EXPLANATION
+================================================================================
+  Project   : Arc Docs AI Assistant
+  Type      : RAG-Powered AI Chatbot
+  Path      : D:\application-docs-rag
+  Date      : March 2026
+================================================================================
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 1 — WHAT IS THIS PROJECT?
+════════════════════════════════════════════════════════════════════════════════
+
+This project is an AI-powered assistant that reads your Arc application's
+HTML documentation and answers questions about it through a chat interface.
+
+Think of it as a private ChatGPT that ONLY knows about YOUR application.
+
+Instead of searching through hundreds of HTML files manually, you type a
+question in natural language and instantly get an accurate, sourced answer.
+
+Example:
+  You ask  : "How do I configure SFTP authentication in Arc?"
+  AI replies: "To configure SFTP authentication, navigate to the SFTP connector
+               settings... [answer from your actual documentation]"
+               Source: SFTP.html, SFTP-Server.html
+
+This is possible because of a technology called RAG (explained in Part 3).
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 2 — WHAT IS ARTIFICIAL INTELLIGENCE & LLM?
+════════════════════════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────
+ 2.1  What is Artificial Intelligence (AI)?
+──────────────────────────────────────────
+
+Artificial Intelligence is the ability of a computer program to perform tasks
+that normally require human intelligence — such as:
+  - Understanding written language
+  - Answering questions
+  - Summarising documents
+  - Writing code
+  - Translating languages
+
+AI is not magic. It is a mathematical model trained on vast amounts of text
+data that has learned patterns of language.
+
+
+──────────────────────────────────────────
+ 2.2  What is an LLM (Large Language Model)?
+──────────────────────────────────────────
+
+An LLM (Large Language Model) is the specific type of AI used in this project.
+
+Definition:
+  An LLM is a deep learning model trained on billions of text documents
+  (websites, books, articles, code) to predict and generate human-like text.
+
+How it works (simplified):
+  1. During training, the model reads billions of sentences.
+  2. It learns: "given these words, what word comes next?"
+  3. Over trillions of such predictions, it learns grammar, facts, reasoning,
+     and how to answer questions.
+  4. The result is a model with hundreds of billions of internal parameters
+     (numbers) that encode all this learned knowledge.
+
+When you ask a question:
+  - The LLM does NOT search the internet.
+  - It generates a response token-by-token based on its learned patterns.
+  - It is predicting "what is the most useful and accurate next word?"
+
+Popular LLMs:
+  - GPT-4o, GPT-4o-mini  (OpenAI) ← used in THIS project
+  - Claude 3.5 Sonnet     (Anthropic)
+  - Gemini 1.5 Pro        (Google)
+  - LLaMA 3               (Meta, open source)
+
+
+──────────────────────────────────────────
+ 2.3  What are Tokens?
+──────────────────────────────────────────
+
+LLMs do not read words — they read TOKENS.
+
+A token is roughly 3-4 characters or 0.75 words.
+  "Hello world"   = 2 tokens
+  "SFTP connector" = 3 tokens
+
+Why does this matter?
+  - Every LLM has a context window (maximum tokens it can read at once)
+  - GPT-4o-mini handles ~128,000 tokens (~96,000 words) at once
+  - This is why we split documents into chunks — to stay within limits
+  - OpenAI charges per token used (both input and output)
+
+
+──────────────────────────────────────────
+ 2.4  What is OpenAI?
+──────────────────────────────────────────
+
+OpenAI is the company that created the GPT series of LLMs.
+
+They provide access to their models through an API (Application Programming
+Interface) — meaning your code sends a request over the internet and gets
+back an AI-generated response.
+
+OpenAI API services used in this project:
+
+  ┌─────────────────────────────┬───────────────────────────────────────────┐
+  │ Service                     │ Purpose                                   │
+  ├─────────────────────────────┼───────────────────────────────────────────┤
+  │ Chat Completions API        │ Generates answers to your questions       │
+  │ (gpt-4.1)                   │ Endpoint: /v1/chat/completions            │
+  ├─────────────────────────────┼───────────────────────────────────────────┤
+  │ Embeddings API              │ Converts text into 3072-dim vectors       │
+  │ (text-embedding-3-large)    │ Endpoint: /v1/embeddings                  │
+ 2.5  What are Embeddings / Vectors?
+──────────────────────────────────────────
+
+An embedding is a way to convert text into a list of numbers (a vector) that
+captures its MEANING.
+
+Example:
+  "How to configure SFTP?"     →  [0.023, -0.817, 0.442, ... 3072 numbers]
+  "SFTP setup and connection"  →  [0.019, -0.801, 0.431, ... 3072 numbers]
+
+Notice those two vectors are very close to each other — because the sentences
+mean nearly the same thing, even though the words are different.
+
+This is the key insight behind semantic search:
+  You don't search for exact words. You search for similar MEANING.
+
+That is why you can ask "How do I set up file transfer?" and still find
+documentation about "SFTP connector configuration" — the meanings are close.
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 3 — WHAT IS RAG (RETRIEVAL-AUGMENTED GENERATION)?
+════════════════════════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────
+ 3.1  The Problem RAG Solves
+──────────────────────────────────────────
+
+LLMs like GPT-4o-mini have a problem when used for private documentation:
+
+  Problem 1 — Training cutoff:
+    GPT was trained on internet data up to a certain date.
+    It has NEVER seen your Arc application documentation.
+    So if you ask it about Arc, it will make up wrong answers (hallucinate).
+
+  Problem 2 — Context window limit:
+    Even if you pasted your entire documentation into every request,
+    541 HTML files × average 15,000 characters = ~8 million characters.
+    That far exceeds any model's context window and would cost $$$$ per query.
+
+  Problem 3 — Accuracy:
+    LLMs sometimes "hallucinate" — confidently stating wrong facts.
+    With RAG, the model is forced to answer from your actual documents.
+
+
+──────────────────────────────────────────
+ 3.2  What is RAG?
+──────────────────────────────────────────
+
+RAG = Retrieval-Augmented Generation
+
+It is an architecture that combines two systems:
+  1. RETRIEVAL  — a search system that finds relevant document chunks
+  2. GENERATION — an LLM that reads those chunks and writes an answer
+
+The key idea: instead of asking the LLM to remember everything, you
+RETRIEVE the relevant information at query-time and GIVE it to the LLM.
+
+Analogy:
+  Without RAG: You ask someone a question and they answer from memory.
+  With RAG:    You ask someone a question, they first look up the answer
+               in the right book, read it, then explain it to you.
+
+The LLM becomes a "reader and explainer" rather than a "memoriser".
+
+
+──────────────────────────────────────────
+ 3.3  The RAG Pipeline — Step by Step
+──────────────────────────────────────────
+
+INDEXING PHASE (runs once when you click ⚡ Index Docs):
+
+  Step 1: READ
+    ┌─────────────────────────────────────────┐
+    │  541 HTML files from your docs folder   │
+    │  BeautifulSoup reads each file          │
+    │  Removes nav, scripts, styles           │
+    │  Extracts clean plain text              │
+    └─────────────────────────────────────────┘
+
+  Step 2: SPLIT
+    ┌─────────────────────────────────────────┐
+    │  Each file's text is split into chunks  │
+    │   - Chunk size:    1500 characters      │
+    │   - Overlap:        300 characters      │
+    │  540 files → 4179 chunks                │
+    └─────────────────────────────────────────┘
+
+  Step 3: EMBED  (OpenAI Embeddings API called here)
+    ┌─────────────────────────────────────────┐
+    │  Each of the 4179 chunks is sent to     │
+    │  OpenAI Embeddings API                  │
+    │  Returns a 3072-number vector per chunk │
+    │  (text-embedding-3-large)               │
+    │  4179 chunks → 4179 vectors             │
+    └─────────────────────────────────────────┘
+
+  Step 4: STORE
+    ┌─────────────────────────────────────────┐
+    │  All 4179 vectors + original text       │
+    │  saved to ChromaDB (local SQLite file)  │
+    │  Located at: ./chroma_db/               │
+    └─────────────────────────────────────────┘
+
+
+QUERY PHASE (runs every time you ask a question):
+
+  Step 1: REWRITE (if conversation history exists)
+    ┌─────────────────────────────────────────┐
+    │  History: "What is REST connector?"     │
+    │  You ask: "How do I authenticate it?"   │
+    │                                         │
+    │  LangChain sends both to GPT:           │
+    │  "Rewrite as standalone question"       │
+    │                                         │
+    │  GPT rewrites:                          │
+    │  "How do I authenticate the REST        │
+    │   connector in Arc?"                    │
+    └─────────────────────────────────────────┘
+
+  Step 2: EMBED THE QUESTION (OpenAI Embeddings API)
+    ┌─────────────────────────────────────────┐
+    │  The rewritten question is embedded     │
+    │  into a 1536-number vector              │
+    └─────────────────────────────────────────┘
+
+  Step 3: RETRIEVE (ChromaDB MMR search)
+    ┌─────────────────────────────────────────┐
+    │  Question vector compared to all 6240   │
+    │  stored vectors using cosine similarity │
+    │                                         │
+    │  MMR (Maximal Marginal Relevance)       │
+    │  returns top 5 most relevant AND        │
+    │  diverse chunks                         │
+    │                                         │
+    │  Returns: 5 text chunks + source files  │
+    └─────────────────────────────────────────┘
+
+  Step 4: GENERATE (OpenAI Chat Completions API)
+    ┌─────────────────────────────────────────┐
+    │  Prompt sent to GPT-4o-mini:            │
+    │                                         │
+    │  SYSTEM: "You are a helpful assistant.  │
+    │  Answer using ONLY this documentation: │
+    │   [chunk 1 from REST.html]              │
+    │   [chunk 2 from REST.html]              │
+    │   [chunk 3 from Webhook.html]           │
+    │   [chunk 4 from Script.html]            │
+    │   [chunk 5 from REST.html]"             │
+    │                                         │
+    │  HISTORY: [previous messages]           │
+    │  USER:    "How do I authenticate it?"   │
+    │                                         │
+    │  GPT reads the chunks and writes        │
+    │  a grounded, accurate answer            │
+    └─────────────────────────────────────────┘
+
+  Step 5: RETURN
+    ┌─────────────────────────────────────────┐
+    │  Answer text sent back to browser       │
+    │  Source files listed below the answer   │
+    └─────────────────────────────────────────┘
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 4 — PROJECT FILE STRUCTURE & WHAT EACH FILE DOES
+════════════════════════════════════════════════════════════════════════════════
+
+  D:\application-docs-rag\
+  │
+  ├── .env                    ← Secret configuration file
+  │                             OPENAI_API_KEY, model names, paths
+  │                             NEVER commit this to Git
+  │
+  ├── requirements.txt        ← List of Python packages to install
+  │                             pip install -r requirements.txt reads this
+  │
+  ├── main.py                 ← FastAPI web server
+  │                             Defines all API routes (/api/chat, /api/ingest)
+  │                             Entry point: uvicorn main:app
+  │
+  ├── rag_engine.py           ← Core RAG logic
+  │                             Builds the LangChain retrieval chain
+  │                             Connects ChromaDB retriever + OpenAI LLM
+  │                             Manages conversation history
+  │
+  ├── ingest.py               ← Document ingestion pipeline
+  │                             Reads HTML files → strips noise → splits
+  │                             → embeds → stores in ChromaDB
+  │
+  ├── static/
+  │   └── index.html          ← The entire chat user interface
+  │                             Pure HTML + CSS + JavaScript (no frameworks)
+  │                             Communicates with FastAPI via fetch() calls
+  │
+  ├── chroma_db/              ← Auto-created after first ingestion
+  │                             Local vector database (SQLite file)
+  │                             Contains all 4179 embedded document chunks
+  │                             Delete this folder to re-index from scratch
+  │
+  ├── docs/                   ← (Optional) local docs folder
+  │                             Not used — DOCS_DIR in .env points to
+  │                             D:\Arc.help.AZN\Arc.help.AZN\mft
+  │
+  ├── README.md               ← Setup guide and documentation
+  └── PROJECT_ARCHITECTURE.txt ← This file
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 5 — TECHNOLOGY STACK — WHAT EACH TOOL IS AND WHY WE USE IT
+════════════════════════════════════════════════════════════════════════════════
+
+┌───────────────────────┬──────────────────────────────────────────────────────┐
+│ Technology            │ What it is & Why we use it                          │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ Python 3.12           │ Programming language for the backend.               │
+│                       │ Why: Most AI/ML libraries are Python-first.         │
+│                       │ Version 3.12 specifically because 3.14 breaks       │
+│                       │ several dependencies.                               │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ FastAPI               │ Modern Python web framework for building APIs.      │
+│                       │ Why: Extremely fast, auto-generates API docs,       │
+│                       │ handles async requests, built-in data validation.   │
+│                       │ Serves both the REST API and the HTML frontend.     │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ Uvicorn               │ ASGI web server that runs FastAPI.                  │
+│                       │ Why: Required to run async FastAPI applications.    │
+│                       │ Command: uvicorn main:app --reload --port 8000      │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ LangChain             │ Framework for building LLM applications.            │
+│                       │ Why: Provides ready-made components for:            │
+│                       │  - Building retrieval chains                        │
+│                       │  - Managing prompts                                 │
+│                       │  - Connecting LLMs to vector stores                 │
+│                       │  - Handling chat history                            │
+│                       │ Without LangChain, we would write hundreds of       │
+│                       │ lines of boilerplate code manually.                 │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ langchain-classic     │ LangChain 1.x sub-package containing chain          │
+│                       │ utilities (create_retrieval_chain,                  │
+│                       │ create_stuff_documents_chain).                      │
+│                       │ These were moved out of the main langchain          │
+│                       │ package in version 1.0.                             │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ langchain-openai      │ LangChain's OpenAI integration layer.               │
+│                       │ Provides: ChatOpenAI, OpenAIEmbeddings classes.     │
+│                       │ Handles API key auth, retry logic, streaming.       │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ ChromaDB              │ Open-source local vector database.                  │
+│                       │ Why: Runs entirely on your machine (no cloud),      │
+│                       │ stores document vectors as a SQLite file,           │
+│                       │ supports fast similarity search over millions        │
+│                       │ of vectors, free to use.                            │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ langchain-community   │ Community retrievers and HuggingFace cross-encoder  │
+│                       │ integration. Provides HuggingFaceCrossEncoder.      │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ OpenAI (SDK)          │ Official Python library for calling OpenAI APIs.    │
+│                       │ Handles: HTTP requests, rate limiting, retries,     │
+│                       │ streaming responses.                                │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ BeautifulSoup4        │ Python library for parsing HTML files.              │
+│                       │ Why: Your documentation is in .html format.         │
+│                       │ BS4 strips out all HTML tags, navigation menus,     │
+│                       │ scripts, styles and extracts only the readable text.│
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ lxml                  │ Fast HTML/XML parser engine.                        │
+│                       │ Why: BeautifulSoup uses it as its parsing backend.  │
+│                       │ Much faster than Python's built-in html.parser.     │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ tiktoken              │ OpenAI's tokenizer library.                         │
+│                       │ Why: Counts tokens accurately before sending text   │
+│                       │ to OpenAI so we stay within context limits.         │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ python-dotenv         │ Loads the .env file into environment variables.     │
+│                       │ Why: Keeps secrets (API keys) out of the code.      │
+│                       │ os.getenv("OPENAI_API_KEY") reads from .env file.   │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ Pydantic              │ Data validation library.                            │
+│                       │ Why: FastAPI uses it to validate all incoming API   │
+│                       │ request data and outgoing response data.            │
+│                       │ Ensures the chat request always has "question"      │
+│                       │ and "history" fields with correct types.            │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ sentence-transformers │ HuggingFace library for transformer-based models.   │
+│                       │ Why: Provides the cross-encoder reranker model      │
+│                       │ (ms-marco-MiniLM-L-6-v2) used in stage 2 of        │
+│                       │ retrieval. Processes query+chunk pairs jointly for  │
+│                       │ far more accurate relevance scoring than            │
+│                       │ embedding similarity alone (~22MB, cached locally). │
+└───────────────────────┴──────────────────────────────────────────────────────┘
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 6 — COMPLETE ARCHITECTURE DIAGRAM
+════════════════════════════════════════════════════════════════════════════════
+
+
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║                         USER'S BROWSER                                  ║
+  ║                                                                          ║
+  ║   ┌──────────────────────────────────────────────────────────────────┐   ║
+  ║   │                  static/index.html (Chat UI)                     │   ║
+  ║   │                                                                  │   ║
+  ║   │   [⚡ Index Docs]   [🗑 Clear Chat]   ✓ Ready — 6240 vectors     │   ║
+  ║   │  ─────────────────────────────────────────────────────────────   │   ║
+  ║   │   AI: To configure SFTP, navigate to the connector settings...   │   ║
+  ║   │       📄 Sources: SFTP.html, SFTP-Server.html                   │   ║
+  ║   │  ─────────────────────────────────────────────────────────────   │   ║
+  ║   │   [Type your question here...                          ] [Send]  │   ║
+  ║   └─────────────────────┬────────────────────┬────────────────────  ┘   ║
+  ╚═════════════════════════│════════════════════│═══════════════════════════╝
+                            │ POST /api/chat      │ POST /api/ingest
+                            │ {question,history}  │ {docs_dir, reset}
+                            ▼                     ▼
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║                     FASTAPI BACKEND  (main.py)                          ║
+  ║                                                                          ║
+  ║   GET  /              →  serves static/index.html                       ║
+  ║   GET  /api/status    →  checks if chroma_db/ exists and has vectors    ║
+  ║   POST /api/ingest    →  calls ingest.py → run_ingestion()              ║
+  ║   POST /api/chat      →  calls rag_engine.py → ask()                    ║
+  ╚══════════════╤═══════════════════════════════════╤═════════════════════╝
+                 │                                   │
+                 ▼                                   ▼
+  ╔═════════════════════════╗         ╔════════════════════════════════════╗
+  ║    ingest.py            ║         ║    rag_engine.py                   ║
+  ║                         ║         ║                                    ║
+  ║  1. glob **/*.html      ║         ║  1. load_vector_store()            ║
+  ║  2. BeautifulSoup       ║         ║     ChromaDB.load(chroma_db/)      ║
+  ║     strip noise         ║         ║                                    ║
+  ║  3. RecursiveText       ║         ║  2. Build LangChain chain:         ║
+  ║     Splitter            ║         ║     Chain 1: history_aware         ║
+  ║     1000 chars          ║         ║              _retriever            ║
+  ║     200 overlap         ║         ║     Chain 2: stuff_documents       ║
+  ║  4. OpenAI Embeddings   ║         ║              _chain (QA)           ║
+  ║     → vectors           ║         ║                                    ║
+  ║  5. Chroma.from_docs()  ║         ║  3. chain.invoke(                  ║
+  ║     → save chroma_db/   ║         ║       input=question,              ║
+  ╚══════════╤══════════════╝         ║       chat_history=history)        ║
+             │                        ╚══════╤════════════════╤════════════╝
+             │                               │                │
+             ▼                               ▼                ▼
+  ╔══════════════════╗            ╔═══════════════╗   ╔═════════════════════╗
+  ║   ChromaDB       ║            ║   ChromaDB    ║   ║   OpenAI API        ║
+  ║   (chroma_db/)   ║            ║   MMR Search  ║   ║                     ║
+  ║                  ║            ║               ║   ║  /v1/embeddings     ║
+  ║  SQLite file     ║◄───────────║  question     ║   ║  text-embedding     ║
+  ║  6240 vectors    ║  stores    ║  vector vs    ║   ║  -3-small           ║
+  ║  + text chunks   ║            ║  6240 stored  ║   ║                     ║
+  ║  + source files  ║────────────►  vectors      ║   ║  /v1/chat/          ║
+  ╚══════════════════╝  retrieves ║               ║   ║  completions        ║
+                                  ║  Returns top  ║   ║  gpt-4o-mini        ║
+                                  ║  5 chunks     ║   ║                     ║
+                                  ╚═══════════════╝   ╚═════════════════════╝
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 7 — HOW THE OPENAI API IS CALLED (EXACT DETAIL)
+════════════════════════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────
+ 7.1  Embeddings API Call
+──────────────────────────────────────────
+
+Called during: ingestion (for all chunks) AND for each user question
+
+HTTP Request:
+  POST https://api.openai.com/v1/embeddings
+  Authorization: Bearer sk-your-key
+  Content-Type: application/json
+
+  Body:
+  {
+    "model": "text-embedding-3-small",
+    "input": "To configure SFTP, navigate to the connector settings..."
+  }
+
+HTTP Response:
+  {
+    "data": [{
+      "embedding": [0.023, -0.817, 0.442, 0.198, ...],  // 1536 numbers
+      "index": 0
+    }],
+    "usage": { "prompt_tokens": 42, "total_tokens": 42 }
+  }
+
+Cost: ~$0.00002 per 1000 tokens (very cheap — whole 6240 chunk index costs ~$0.05)
+
+
+──────────────────────────────────────────
+ 7.2  Chat Completions API Call
+──────────────────────────────────────────
+
+Called during: every user question (after retrieval)
+
+HTTP Request:
+  POST https://api.openai.com/v1/chat/completions
+  Authorization: Bearer sk-your-key
+  Content-Type: application/json
+
+  Body:
+  {
+    "model": "gpt-4o-mini",
+    "temperature": 0.2,
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant that answers questions about
+                    the application based strictly on the provided documentation.
+                    Use the retrieved context below to answer the question.
+                    If the answer is not found, say 'I could not find relevant
+                    information in the documentation.'
+
+                    --- DOCUMENTATION CONTEXT ---
+                    [Chunk 1: text from SFTP.html about authentication...]
+                    [Chunk 2: text from SFTP.html about connection settings...]
+                    [Chunk 3: text from SFTP-Server.html about setup...]
+                    [Chunk 4: text from SCP.html about key files...]
+                    [Chunk 5: text from SFTP.html about error handling...]"
+      },
+      {
+        "role": "user",
+        "content": "What is the SFTP connector?"
+      },
+      {
+        "role": "assistant",
+        "content": "The SFTP connector allows secure file transfers..."
+      },
+      {
+        "role": "user",
+        "content": "How do I configure authentication for it?"
+      }
+    ]
+  }
+
+HTTP Response:
+  {
+    "choices": [{
+      "message": {
+        "role": "assistant",
+        "content": "To configure SFTP authentication in Arc, follow these steps:
+                    1. Navigate to the SFTP connector settings...
+                    2. Select the Authentication Type..."
+      }
+    }],
+    "usage": {
+      "prompt_tokens": 1842,
+      "completion_tokens": 312,
+      "total_tokens": 2154
+    }
+  }
+
+Cost: ~$0.00015 per 1000 input tokens + $0.00060 per 1000 output tokens
+      (a typical question costs less than $0.001 = less than 0.1 paise)
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 8 — HOW LANGCHAIN WORKS IN THIS PROJECT
+════════════════════════════════════════════════════════════════════════════════
+
+LangChain is a framework that chains together AI components.
+Without LangChain, we would manually write all the API calls, prompt
+construction, history management, and retrieval logic ourselves.
+
+LangChain components used:
+
+  1. ChatOpenAI
+     Wraps the OpenAI Chat Completions API.
+     Handles: API key, model selection, temperature, streaming, retries.
+
+  2. OpenAIEmbeddings
+     Wraps the OpenAI Embeddings API.
+     Handles: Batching multiple chunks into single API calls (efficient).
+
+  3. Chroma (from langchain-chroma)
+     Wraps ChromaDB.
+     Provides: as_retriever() — turns vector DB into a LangChain retriever.
+
+  4. RecursiveCharacterTextSplitter (from langchain-text-splitters)
+     Splits long text into chunks.
+     Strategy: tries to split on \n\n first, then \n, then ". ", then " "
+     Preserves semantic boundaries as much as possible.
+
+  5. ChatPromptTemplate
+     Defines the structure of prompts sent to the LLM.
+     Uses placeholders: {context}, {input}, {chat_history}
+
+  6. create_history_aware_retriever
+     Chain 1: Takes question + history → rewrites question → retrieves chunks.
+
+  7. ContextualCompressionRetriever (new)
+     Wraps the MMR retriever with a cross-encoder reranker.
+     After MMR returns 30 candidates, the cross-encoder re-scores each
+     (query, chunk) pair jointly and returns the top 8 most relevant.
+
+  8. create_stuff_documents_chain
+     Chain 2: Takes reranked chunks → stuffs them into prompt → LLM answers.
+
+  9. create_retrieval_chain
+     Connects Chain 1 and Chain 2 into one end-to-end pipeline.
+
+  Chain execution flow:
+  input question + history
+        │
+        ▼
+  create_history_aware_retriever
+        │ rewrites + expands question using gpt-4.1
+        ▼
+  Chroma MMR retriever
+        │ returns 30 diverse candidate chunks (TOP_K × 2)
+        ▼
+  ContextualCompressionRetriever (cross-encoder reranker)
+        │ re-scores all 30 → keeps top 8 (RERANKER_TOP_N)
+        ▼
+  create_stuff_documents_chain
+        │ injects top 8 chunks into strict rules prompt
+        ▼
+  ChatOpenAI (gpt-4.1, temperature=0.1)
+        │ generates grounded answer
+        ▼
+  {"answer": "...", "context": [8 Document objects]}
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 9 — WHY THIS APPROACH IS USEFUL
+════════════════════════════════════════════════════════════════════════════════
+
+  ✓ ACCURACY
+    The LLM can only answer from your actual documentation.
+    It cannot make up features that don't exist in Arc.
+    Every answer is traceable to a source file.
+
+  ✓ PRIVACY
+    Your documentation never leaves your machine permanently.
+    ChromaDB is local (no cloud database).
+    Only the text chunks relevant to each question are sent to OpenAI.
+    The full documentation is never uploaded anywhere.
+
+  ✓ ALWAYS UP TO DATE
+    Click ⚡ Index Docs whenever you update your HTML files.
+    The index rebuilds in minutes with the latest content.
+
+  ✓ COST EFFECTIVE
+    One-time indexing of 541 files costs ~$0.05 in OpenAI credits.
+    Each question costs less than $0.001.
+    No monthly subscriptions, no per-seat licensing.
+
+  ✓ FAST
+    After indexing, answers are generated in 2-5 seconds.
+    ChromaDB vector search over 4179 vectors takes milliseconds.
+    Cross-encoder reranker runs locally (no extra API call).
+
+  ✓ CONTEXT-AWARE
+    The AI remembers your full conversation.
+    Follow-up questions ("How do I do that with authentication?")
+    correctly understand what "that" refers to.
+
+  ✓ NO INFRASTRUCTURE
+    Runs entirely on a laptop/desktop.
+    No cloud servers, no Docker, no Kubernetes.
+    One command: uvicorn main:app --port 8000
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 10 — CONFIGURATION REFERENCE (.env file)
+════════════════════════════════════════════════════════════════════════════════
+
+  Variable           Default                   Description
+  ─────────────────────────────────────────────────────────────────────────
+  OPENAI_API_KEY     (required)                Your OpenAI secret key
+                                               Get from: platform.openai.com
+
+  CHAT_MODEL         gpt-4o-mini               LLM used for answering
+                                               Options: gpt-4o, gpt-4-turbo
+                                               gpt-4o = smarter, 10x costlier
+
+  EMBEDDING_MODEL    text-embedding-3-small    Model for creating vectors
+                                               Do not change unless needed
+
+  DOCS_DIR           D:\Arc.help.AZN\          Path to your HTML docs folder
+                     Arc.help.AZN\mft          Change to point to your files
+
+  CHROMA_DB_DIR      ./chroma_db               Where vectors are stored
+                                               Auto-created on first ingest
+
+  CHUNK_SIZE         1000                      Characters per chunk
+                                               Smaller = more precise retrieval
+                                               Larger = more context per chunk
+
+  CHUNK_OVERLAP      200                       Overlap between chunks
+                                               Prevents sentences being cut off
+
+  RETRIEVER_TOP_K    5                         How many chunks to retrieve
+                                               More = more context, higher cost
+
+
+════════════════════════════════════════════════════════════════════════════════
+ PART 11 — GLOSSARY OF TERMS
+════════════════════════════════════════════════════════════════════════════════
+
+  Term                  Definition
+  ────────────────────────────────────────────────────────────────────────────
+  AI                    Artificial Intelligence — software that performs
+                        tasks requiring human-like reasoning
+
+  LLM                   Large Language Model — an AI model trained on text
+                        to understand and generate human language
+
+  GPT                   Generative Pre-trained Transformer — OpenAI's LLM
+                        family (GPT-4, GPT-4o, GPT-4.1)
+
+  Token                 A unit of text (~3-4 chars). LLMs process tokens,
+                        not words. Costs and limits are measured in tokens.
+
+  Embedding             A vector (list of numbers) representing the meaning
+                        of text. Similar text = similar vectors.
+
+  Vector                A list of floating-point numbers.
+                        e.g. [0.023, -0.817, 0.442, ...]
+
+  Vector Database       A database optimised for storing and searching vectors
+                        by similarity. ChromaDB is one example.
+
+  Semantic Search       Finding content by meaning rather than exact keywords
+
+  RAG                   Retrieval-Augmented Generation — combining a search
+                        system with an LLM to answer questions from documents
+
+  Chunking              Splitting large documents into smaller pieces so they
+                        fit within LLM context windows
+
+  Hallucination         When an LLM confidently states something incorrect.
+                        RAG reduces this by grounding answers in real docs.
+
+  Context Window        Maximum amount of text an LLM can process at once
+
+  MMR                   Maximal Marginal Relevance — retrieval algorithm that
+                        returns relevant AND diverse results (not duplicates)
+
+  ASGI                  Async Server Gateway Interface — Python web server
+                        standard. Uvicorn is an ASGI server.
+
+  API                   Application Programming Interface — a way for two
+                        programs to communicate with each other
+
+  REST API              A type of API that uses HTTP requests (GET, POST, etc.)
+
+  FastAPI               Python web framework for building REST APIs
+
+  ChromaDB              Open-source local vector database
+
+  LangChain             Framework for building LLM-powered applications
+
+  Cross-Encoder       A model that reads a (query, document) pair together
+                      and scores their relevance. More accurate than embedding
+                      similarity but slower. Used in the reranking step.
+
+  Reranking           A second-pass relevance scoring step. MMR retrieves a
+                      broad candidate set; the cross-encoder reranks it to
+                      surface the truly most relevant chunks for the LLM.
+
+  Temperature         LLM parameter controlling randomness.
+                      0.0 = deterministic/factual, 1.0 = creative/random
+                      Set to 0.1 in this project for maximum factual accuracy.
+
+  Embeddings API        OpenAI service that converts text to vectors
+
+  Chat Completions API  OpenAI service that generates text responses
+
+================================================================================
+                          END OF DOCUMENT
+================================================================================

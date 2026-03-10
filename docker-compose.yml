@@ -1,0 +1,35 @@
+services:
+  arcmind:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arcmind
+    ports:
+      - "8000:8000"
+    environment:
+      # Loaded from your local .env file — never commit .env to Git
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CHAT_MODEL=${CHAT_MODEL:-gpt-4o-mini}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - CHROMA_DB_DIR=/app/chroma_db
+      - DOCS_DIR=/app/docs
+      - RERANKER_ENABLED=${RERANKER_ENABLED:-true}
+      - RERANKER_MODEL=${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
+      - RETRIEVER_TOP_K=${RETRIEVER_TOP_K:-8}
+      - RERANKER_TOP_N=${RERANKER_TOP_N:-8}
+    volumes:
+      # Persist the vector store across container restarts
+      - chroma_data:/app/chroma_db
+      # Mount local docs folder so you can add/update documents without rebuilding
+      - ./docs:/app/docs:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/status')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  chroma_data:
+    driver: local

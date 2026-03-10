@@ -1,0 +1,38 @@
+# Virtual environment — never copy into image
+.venv/
+venv/
+
+# Secrets — injected at runtime via env vars
+.env
+
+# Vector store — mounted as a volume at runtime
+chroma_db/
+
+# Documents — mounted as a volume at runtime
+docs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Git
+.git/
+.gitignore
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+install_log.txt
+
+# Editor
+.vscode/
+*.swp
