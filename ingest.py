@@ -15,8 +15,11 @@ import argparse
 import glob
 import logging
 import re
+import time
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
+import requests
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -32,6 +35,7 @@ load_dotenv()
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 DOCS_DIR        = os.getenv("DOCS_DIR", "./docs")
+DOCS_URL        = os.getenv("DOCS_URL", "")          # takes priority over DOCS_DIR when set
 CHROMA_DB_DIR   = os.getenv("CHROMA_DB_DIR", "./chroma_db")
 CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "200"))
@@ -75,6 +79,97 @@ def parse_html_file(filepath: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def parse_html_content(html: str) -> str:
+    """
+    Parse an HTML string and return clean plain text.
+    Same cleaning logic as parse_html_file but operates on a string.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(_NOISE_TAGS):
+        tag.decompose()
+    text = soup.get_text(separator="\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Web crawler — fetches all HTML pages under a base URL
+# ---------------------------------------------------------------------------
+
+_SKIP_EXTENSIONS = (
+    ".css", ".js", ".png", ".jpg", ".jpeg", ".gif",
+    ".svg", ".ico", ".pdf", ".zip", ".woff", ".woff2", ".ttf",
+)
+
+
+def crawl_site(base_url: str) -> list[Document]:
+    """
+    Recursively crawl all HTML pages reachable from base_url that stay
+    within the same URL prefix.  Returns a list of LangChain Documents.
+    """
+    # Ensure base_url ends with / so prefix matching works correctly
+    if not base_url.endswith("/"):
+        base_url += "/"
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+
+    visited: set[str] = set()
+    to_visit: list[str] = [base_url]
+    documents: list[Document] = []
+
+    log.info("Starting web crawl from '%s'.", base_url)
+
+    while to_visit:
+        url = to_visit.pop(0).split("#")[0]  # strip fragment
+        if not url or url in visited:
+            continue
+        if not url.startswith(base_url):
+            continue  # stay within the base prefix
+        if any(url.lower().endswith(ext) for ext in _SKIP_EXTENSIONS):
+            continue  # skip non-HTML assets
+
+        visited.add(url)
+
+        try:
+            resp = session.get(url, timeout=15)
+            if resp.status_code != 200:
+                log.warning("  Skipping %s (HTTP %d)", url, resp.status_code)
+                continue
+            if "text/html" not in resp.headers.get("Content-Type", ""):
+                continue
+
+            text = parse_html_content(resp.text)
+            if text:
+                documents.append(Document(
+                    page_content=text,
+                    metadata={"source": url},
+                ))
+                log.info("  Crawled: %s (%d chars)", url, len(text))
+
+            # Discover new links on this page
+            soup = BeautifulSoup(resp.text, "lxml")
+            for a in soup.find_all("a", href=True):
+                href = urljoin(url, a["href"]).split("#")[0]
+                if href not in visited and href.startswith(base_url):
+                    to_visit.append(href)
+
+            time.sleep(0.05)  # polite crawl delay
+
+        except Exception as exc:
+            log.error("  Failed to crawl '%s': %s", url, exc)
+
+    log.info("Web crawl complete — fetched %d page(s).", len(documents))
+    return documents
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +262,14 @@ def embed_and_store(chunks: list[Document], reset: bool = False) -> int:
     )
 
     if reset and os.path.isdir(CHROMA_DB_DIR):
-        import shutil, gc, time
-        gc.collect()  # release any lingering file handles (important on Windows)
+        import shutil, gc
+        # Release the in-process ChromaDB client first (avoids WinError 32)
+        try:
+            import rag_engine
+            rag_engine.release_vector_store()
+        except Exception:
+            pass
+        gc.collect()
         for attempt in range(5):
             try:
                 shutil.rmtree(CHROMA_DB_DIR)
@@ -195,17 +296,41 @@ def embed_and_store(chunks: list[Document], reset: bool = False) -> int:
 # Convenience function called by the FastAPI /ingest endpoint
 # ---------------------------------------------------------------------------
 
-def run_ingestion(docs_dir: str = DOCS_DIR, reset: bool = True) -> dict:
+def run_ingestion(docs_dir: str = None, reset: bool = True) -> dict:
     """
     Full ingestion pipeline: load → split → embed → store.
 
+    Re-reads DOCS_URL and DOCS_DIR from environment on every call so that
+    .env changes take effect without restarting the server.
+
+    When DOCS_URL env var is set, pages are crawled from the web.
+    Otherwise documents are loaded from docs_dir on disk.
+
     Returns a status dict: {"status", "files_loaded", "chunks_created", "vectors_stored"}
     """
-    docs = load_documents(docs_dir)
+    # Re-read at call time so .env changes are always picked up.
+    # Use dotenv_values() to read ONLY what's explicitly set in the .env file
+    # (ignores OS-level env vars), preventing stale values from leaking in.
+    load_dotenv(override=True)
+    from dotenv import dotenv_values
+    env_file_values = dotenv_values()
+    # env_file_values covers local Python runs (reads .env file directly).
+    # os.getenv() covers Docker runs (container has no .env file — values come from env vars).
+    docs_url = (env_file_values.get("DOCS_URL") or os.getenv("DOCS_URL", "")).strip()
+    effective_docs_dir = docs_dir or env_file_values.get("DOCS_DIR") or os.getenv("DOCS_DIR", DOCS_DIR)
+
+    if docs_url:
+        log.info("DOCS_URL is set — crawling from web: %s", docs_url)
+        docs = crawl_site(docs_url)
+        source_label = docs_url
+    else:
+        docs = load_documents(effective_docs_dir)
+        source_label = effective_docs_dir
+
     if not docs:
         return {
             "status": "error",
-            "message": f"No HTML files found in '{docs_dir}'.",
+            "message": f"No documents found from '{source_label}'.",
             "files_loaded": 0,
             "chunks_created": 0,
             "vectors_stored": 0,

@@ -73,6 +73,22 @@ def load_vector_store() -> Chroma:
     return _vector_store
 
 
+def release_vector_store() -> None:
+    """Release the in-memory ChromaDB client so its file handles are freed.
+    Must be called before deleting chroma_db/ on Windows to avoid WinError 32."""
+    global _vector_store, _rag_chain
+    _rag_chain = None
+    _vector_store = None
+    import gc
+    gc.collect()
+    # ChromaDB uses an internal singleton — clear it to release the SQLite file lock
+    try:
+        from chromadb.api.client import SharedSystemClient
+        SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
+
+
 def is_vector_store_ready() -> bool:
     """Return True if ChromaDB directory exists and contains documents."""
     if not os.path.isdir(CHROMA_DB_DIR):

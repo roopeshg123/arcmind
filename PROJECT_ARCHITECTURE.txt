@@ -1,9 +1,9 @@
 ================================================================================
        ARC DOCS AI ASSISTANT — COMPLETE PROJECT ARCHITECTURE & EXPLANATION
 ================================================================================
-  Project   : Arc Docs AI Assistant
+  Project   : Arc Docs AI Assistant (ArcMind)
   Type      : RAG-Powered AI Chatbot
-  Path      : D:\application-docs-rag
+  Path      : D:\arcmind
   Date      : March 2026
 ================================================================================
 
@@ -190,10 +190,17 @@ INDEXING PHASE (runs once when you click ⚡ Index Docs):
 
   Step 1: READ
     ┌─────────────────────────────────────────┐
-    │  541 HTML files from your docs folder   │
-    │  BeautifulSoup reads each file          │
-    │  Removes nav, scripts, styles           │
-    │  Extracts clean plain text              │
+    │  Option A — Web crawl (DOCS_URL set):   │
+    │  Starts at https://cdn.cdata.com/help/  │
+    │  AZN/mft/ and follows all links within  │
+    │  that URL prefix, fetching each page    │
+    │  with the requests library              │
+    │                                         │
+    │  Option B — Local files (DOCS_DIR set): │
+    │  Reads .html files from local folder    │
+    │                                         │
+    │  Both paths use BeautifulSoup to strip  │
+    │  nav, scripts, styles and extract text  │
     └─────────────────────────────────────────┘
 
   Step 2: SPLIT
@@ -303,8 +310,10 @@ QUERY PHASE (runs every time you ask a question):
   │                             Manages conversation history
   │
   ├── ingest.py               ← Document ingestion pipeline
-  │                             Reads HTML files → strips noise → splits
-  │                             → embeds → stores in ChromaDB
+  │                             Two modes:
+  │                             1. Web crawl: fetches pages from DOCS_URL
+  │                             2. Local files: reads from DOCS_DIR
+  │                             Both: strips noise → splits → embeds → stores
   │
   ├── static/
   │   └── index.html          ← The entire chat user interface
@@ -317,8 +326,9 @@ QUERY PHASE (runs every time you ask a question):
   │                             Delete this folder to re-index from scratch
   │
   ├── docs/                   ← (Optional) local docs folder
-  │                             Not used — DOCS_DIR in .env points to
-  │                             D:\Arc.help.AZN\Arc.help.AZN\mft
+  │                             Not used — DOCS_URL in .env points to
+  │                             https://cdn.cdata.com/help/AZN/mft/
+  │                             Set DOCS_URL= and DOCS_DIR=./docs to use local
   │
   ├── README.md               ← Setup guide and documentation
   └── PROJECT_ARCHITECTURE.txt ← This file
@@ -406,6 +416,16 @@ QUERY PHASE (runs every time you ask a question):
 │                       │ retrieval. Processes query+chunk pairs jointly for  │
 │                       │ far more accurate relevance scoring than            │
 │                       │ embedding similarity alone (~22MB, cached locally). │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ requests              │ Standard Python HTTP client library.                │
+│                       │ Why: Used by the web crawler in ingest.py to fetch  │
+│                       │ HTML pages from DOCS_URL. Handles timeouts,         │
+│                       │ redirects, and Content-Type checking.               │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ Docker / Podman       │ Container runtime for packaging and deploying the   │
+│                       │ application. Dockerfile defines the image build.    │
+│                       │ docker-compose.yml defines how to run it locally.   │
+│                       │ Means teammates need zero Python/pip setup.         │
 └───────────────────────┴──────────────────────────────────────────────────────┘
 
 
@@ -444,8 +464,14 @@ QUERY PHASE (runs every time you ask a question):
   ╔═════════════════════════╗         ╔════════════════════════════════════╗
   ║    ingest.py            ║         ║    rag_engine.py                   ║
   ║                         ║         ║                                    ║
-  ║  1. glob **/*.html      ║         ║  1. load_vector_store()            ║
-  ║  2. BeautifulSoup       ║         ║     ChromaDB.load(chroma_db/)      ║
+  ║  if DOCS_URL set:       ║         ║  1. load_vector_store()            ║
+  ║  1. crawl_site()        ║         ║     ChromaDB.load(chroma_db/)      ║
+  ║     requests.get()      ║         ║                                    ║
+  ║     follow href links   ║         ║  2. Build LangChain chain:         ║
+  ║     stay within prefix  ║         ║     Chain 1: history_aware         ║
+  ║  else (DOCS_DIR):       ║         ║              _retriever            ║
+  ║  1. glob **/*.html      ║         ║     Chain 2: stuff_documents       ║
+  ║  2. BeautifulSoup       ║         ║              _chain (QA)           ║
   ║     strip noise         ║         ║                                    ║
   ║  3. RecursiveText       ║         ║  2. Build LangChain chain:         ║
   ║     Splitter            ║         ║     Chain 1: history_aware         ║
@@ -674,10 +700,15 @@ LangChain components used:
     Follow-up questions ("How do I do that with authentication?")
     correctly understand what "that" refers to.
 
-  ✓ NO INFRASTRUCTURE
-    Runs entirely on a laptop/desktop.
-    No cloud servers, no Docker, no Kubernetes.
-    One command: uvicorn main:app --port 8000
+  ✓ NO LOCAL DOCS NEEDED
+    Documentation is crawled directly from the live URL.
+    No need to maintain a local copy of HTML files.
+    Teammates only need an OPENAI_API_KEY to get started.
+
+  ✓ PORTABLE — DOCKER / PODMAN SUPPORT
+    Runs in a container with docker compose up --build.
+    No Python install required on teammates' machines.
+    Works identically on Windows, macOS, and Linux.
 
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -696,8 +727,14 @@ LangChain components used:
   EMBEDDING_MODEL    text-embedding-3-small    Model for creating vectors
                                                Do not change unless needed
 
-  DOCS_DIR           D:\Arc.help.AZN\          Path to your HTML docs folder
-                     Arc.help.AZN\mft          Change to point to your files
+  DOCS_URL           https://cdn.cdata.com/     URL to crawl docs from.
+                     help/AZN/mft/             Takes priority over DOCS_DIR.
+                                               All pages under this prefix
+                                               are crawled automatically.
+
+  DOCS_DIR           ./docs                    Local HTML folder fallback.
+                                               Only used when DOCS_URL is
+                                               not set.
 
   CHROMA_DB_DIR      ./chroma_db               Where vectors are stored
                                                Auto-created on first ingest

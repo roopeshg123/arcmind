@@ -1,8 +1,11 @@
-# Environment / secrets
+# Environment / secrets — contains API keys, NEVER commit the real one
 .env
 
 # Vector store (rebuild from docs at any time)
 chroma_db/
+
+# Local docs folder (can be large — teammates bring their own copy)
+docs/
 
 # Python
 __pycache__/

@@ -13,3 +13,4 @@ openai>=1.59.9
 tiktoken>=0.8.0
 pydantic>=2.10.5
 sentence-transformers>=3.0.0
+requests>=2.32.0

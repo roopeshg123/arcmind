@@ -6,22 +6,21 @@ services:
     container_name: arcmind
     ports:
       - "8000:8000"
+    env_file:
+      # All variables from .env are passed to the container automatically.
+      # Copy .env.example to .env and fill in your values before running.
+      - .env
     environment:
-      # Loaded from your local .env file — never commit .env to Git
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - CHAT_MODEL=${CHAT_MODEL:-gpt-4o-mini}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      # Force the container to always use the mounted path, regardless of what
+      # DOCS_DIR is set to in .env (which is the Windows host path).
       - CHROMA_DB_DIR=/app/chroma_db
       - DOCS_DIR=/app/docs
-      - RERANKER_ENABLED=${RERANKER_ENABLED:-true}
-      - RERANKER_MODEL=${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
-      - RETRIEVER_TOP_K=${RETRIEVER_TOP_K:-8}
-      - RERANKER_TOP_N=${RERANKER_TOP_N:-8}
     volumes:
+      # Mount the Windows docs folder into the container (used when DOCS_DIR is set in .env).
+      # If you are using DOCS_URL instead, this mounts an empty ./docs folder — harmless.
+      - ${DOCS_DIR:-./docs}:/app/docs:ro
       # Persist the vector store across container restarts
       - chroma_data:/app/chroma_db
-      # Mount local docs folder so you can add/update documents without rebuilding
-      - ./docs:/app/docs:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/status')"]
