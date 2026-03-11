@@ -1,6 +1,3 @@
-# Environment / secrets — contains API keys, NEVER commit the real one
-.env
-
 # Vector store (rebuild from docs at any time)
 chroma_db/
 

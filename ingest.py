@@ -263,7 +263,7 @@ def embed_and_store(chunks: list[Document], reset: bool = False) -> int:
 
     if reset and os.path.isdir(CHROMA_DB_DIR):
         import shutil, gc
-        # Release the in-process ChromaDB client first (avoids WinError 32)
+        # Release the in-process ChromaDB client first (avoids WinError 32 on Windows)
         try:
             import rag_engine
             rag_engine.release_vector_store()
@@ -272,8 +272,16 @@ def embed_and_store(chunks: list[Document], reset: bool = False) -> int:
         gc.collect()
         for attempt in range(5):
             try:
-                shutil.rmtree(CHROMA_DB_DIR)
-                log.info("Deleted existing ChromaDB at '%s'.", CHROMA_DB_DIR)
+                # Delete only the CONTENTS, not the directory itself.
+                # This is required when chroma_db is a Docker volume mount —
+                # the OS forbids removing the mount-point directory (EBUSY/errno 16).
+                for item in os.listdir(CHROMA_DB_DIR):
+                    item_path = os.path.join(CHROMA_DB_DIR, item)
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+                log.info("Cleared existing ChromaDB contents at '%s'.", CHROMA_DB_DIR)
                 break
             except PermissionError:
                 if attempt == 4:
