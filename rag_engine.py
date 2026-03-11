@@ -63,6 +63,12 @@ def _get_reranker() -> CrossEncoderReranker:
     return _reranker
 
 
+def warmup_reranker() -> None:
+    """Pre-load the reranker model into memory so the first request pays no cold-start cost."""
+    if RERANKER_ENABLED:
+        _get_reranker()
+
+
 def load_vector_store() -> Chroma:
     """Load an existing ChromaDB vector store from disk."""
     global _vector_store

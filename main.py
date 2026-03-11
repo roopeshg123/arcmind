@@ -34,12 +34,16 @@ DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-load vector store on startup if it already exists."""
+    """Pre-load vector store, reranker, and RAG chain on startup."""
     if rag_engine.is_vector_store_ready():
         print("[startup] Vector store found — loading into memory…")
         rag_engine.load_vector_store()
+        print("[startup] Pre-building RAG chain and warming up reranker…")
+        rag_engine.get_rag_chain()  # builds chain + loads reranker in one shot
     else:
-        print("[startup] No vector store found yet. Call POST /api/ingest first.")
+        print("[startup] No vector store yet — pre-warming reranker for faster first ingest…")
+        rag_engine.warmup_reranker()
+        print("[startup] Call POST /api/ingest to index your documentation.")
     yield
 
 

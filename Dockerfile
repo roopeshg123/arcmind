@@ -45,12 +45,20 @@ RUN mkdir -p docs chroma_db
 RUN useradd --no-create-home --shell /bin/false appuser \
     && mkdir -p /app/.cache \
     && chown -R appuser:appuser /app
-USER appuser
 
 # Tell HuggingFace / sentence-transformers to cache models inside /app/.cache
 # (avoids PermissionError — the default ~/.cache/huggingface doesn't exist for no-home users)
 ENV HF_HOME=/app/.cache \
     TRANSFORMERS_CACHE=/app/.cache
+
+# Pre-download the cross-encoder reranker model at image-build time so the
+# container never fetches it from HuggingFace at runtime, eliminating the
+# cold-start latency on the first request.
+RUN python -c "from sentence_transformers import CrossEncoder; \
+               CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')" \
+    && chown -R appuser:appuser /app/.cache
+
+USER appuser
 
 # FastAPI port
 EXPOSE 8000
