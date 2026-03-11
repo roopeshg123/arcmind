@@ -240,6 +240,27 @@
     #send-btn:disabled { opacity: .35; cursor: not-allowed; }
     #send-btn svg { fill: #fff; }
 
+    #stop-btn {
+      background: #5a1a1a;
+      border: 1px solid #8b2e2e;
+      border-radius: 10px;
+      padding: 0 18px;
+      cursor: pointer;
+      transition: background .2s, transform .1s;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      flex-shrink: 0;
+      color: #f08080;
+      font-size: .82rem;
+      font-weight: 600;
+      height: 52px;
+    }
+    #stop-btn:hover { background: #7a2020; }
+    #stop-btn:active { transform: scale(.96); }
+    #stop-btn svg { fill: #f08080; }
+
     #input-hint { font-size: .72rem; color: #444; text-align: center; margin-top: 8px; }
   </style>
 </head>
@@ -280,6 +301,10 @@
     <button id="send-btn" type="submit" title="Send">
       <svg width="20" height="20" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
     </button>
+    <button id="stop-btn" type="button" title="Stop generating" onclick="stopGeneration()">
+      <svg width="16" height="16" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+      Stop
+    </button>
   </form>
   <p id="input-hint">Press Enter to send &nbsp;·&nbsp; Shift+Enter for new line</p>
 </div>
@@ -289,6 +314,7 @@
   let chatHistory  = [];   // [{role, content}, …]
   let messageLog   = [];   // [{role, content, sources}, …]  — persisted
   let isLoading    = false;
+  let abortCtrl    = null;  // AbortController for the active request
 
   // ---------------------------------------------------------------- persistence
   function saveSession() {
@@ -397,12 +423,15 @@
 
     const typingId = appendTyping();
     isLoading      = true;
+    abortCtrl      = new AbortController();
     setInputEnabled(false);
+    showStopButton(true);
 
     try {
       const res  = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abortCtrl.signal,
         body: JSON.stringify({
           question,
           history: chatHistory.slice(0, -1),   // exclude the question we just added
@@ -421,14 +450,34 @@
         messageLog.push({ role: "bot", content: data.answer, sources: data.sources || [] });
         saveSession();
       }
-    } catch {
+    } catch (err) {
       removeTyping(typingId);
-      appendMessage("bot", "⚠️ Could not reach the server. Make sure the backend is running.");
+      if (err.name === "AbortError") {
+        // Remove the user message that was never answered from history
+        chatHistory.pop();
+        messageLog.pop();
+        saveSession();
+        appendMessage("bot", "_Generation stopped._");
+      } else {
+        appendMessage("bot", "⚠️ Could not reach the server. Make sure the backend is running.");
+      }
     } finally {
-      isLoading = false;
+      isLoading  = false;
+      abortCtrl  = null;
+      showStopButton(false);
       setInputEnabled(true);
       document.getElementById("question-input").focus();
     }
+  }
+
+  // ---------------------------------------------------------------- stop
+  function stopGeneration() {
+    if (abortCtrl) abortCtrl.abort();
+  }
+
+  function showStopButton(visible) {
+    document.getElementById("stop-btn").style.display  = visible ? "flex" : "none";
+    document.getElementById("send-btn").style.display  = visible ? "none" : "flex";
   }
 
   // ---------------------------------------------------------------- DOM helpers
