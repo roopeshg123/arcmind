@@ -287,10 +287,39 @@
 <script>
   // ---------------------------------------------------------------- state
   let chatHistory  = [];   // [{role, content}, …]
+  let messageLog   = [];   // [{role, content, sources}, …]  — persisted
   let isLoading    = false;
 
+  // ---------------------------------------------------------------- persistence
+  function saveSession() {
+    try {
+      localStorage.setItem("arcmind_chat_history", JSON.stringify(chatHistory));
+      localStorage.setItem("arcmind_message_log",  JSON.stringify(messageLog));
+    } catch { /* storage full or unavailable */ }
+  }
+
+  function restoreSession() {
+    try {
+      const savedHistory = localStorage.getItem("arcmind_chat_history");
+      const savedLog     = localStorage.getItem("arcmind_message_log");
+      if (!savedHistory || !savedLog) return;
+      const history = JSON.parse(savedHistory);
+      const log     = JSON.parse(savedLog);
+      if (!Array.isArray(history) || history.length === 0) return;
+      chatHistory = history;
+      log.forEach(msg => appendMessage(msg.role, msg.content, msg.sources || []));
+      if (log.length > 0) hideEmptyState();
+    } catch {
+      localStorage.removeItem("arcmind_chat_history");
+      localStorage.removeItem("arcmind_message_log");
+    }
+  }
+
   // ---------------------------------------------------------------- startup
-  window.addEventListener("DOMContentLoaded", checkStatus);
+  window.addEventListener("DOMContentLoaded", () => {
+    restoreSession();
+    checkStatus();
+  });
 
   async function checkStatus() {
     const badge = document.getElementById("status-badge");
@@ -363,6 +392,8 @@
     hideEmptyState();
     appendMessage("user", question);
     chatHistory.push({ role: "user", content: question });
+    messageLog.push({ role: "user", content: question, sources: [] });
+    saveSession();
 
     const typingId = appendTyping();
     isLoading      = true;
@@ -387,6 +418,8 @@
         const data = await res.json();
         chatHistory.push({ role: "assistant", content: data.answer });
         appendMessage("bot", data.answer, data.sources);
+        messageLog.push({ role: "bot", content: data.answer, sources: data.sources || [] });
+        saveSession();
       }
     } catch {
       removeTyping(typingId);
@@ -489,6 +522,9 @@
 
   function clearChat() {
     chatHistory = [];
+    messageLog  = [];
+    localStorage.removeItem("arcmind_chat_history");
+    localStorage.removeItem("arcmind_message_log");
     const container = document.getElementById("messages");
     container.innerHTML = `
       <div id="empty-state">
