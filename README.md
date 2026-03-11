@@ -119,6 +119,8 @@ CHROMA_DB_DIR=./chroma_db
 
 ```powershell
 python main.py
+or
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Then open [http://localhost:8000](http://localhost:8000) in your browser.

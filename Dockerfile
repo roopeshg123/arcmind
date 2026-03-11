@@ -43,8 +43,14 @@ RUN mkdir -p docs chroma_db
 
 # Run as non-root user for security
 RUN useradd --no-create-home --shell /bin/false appuser \
+    && mkdir -p /app/.cache \
     && chown -R appuser:appuser /app
 USER appuser
+
+# Tell HuggingFace / sentence-transformers to cache models inside /app/.cache
+# (avoids PermissionError — the default ~/.cache/huggingface doesn't exist for no-home users)
+ENV HF_HOME=/app/.cache \
+    TRANSFORMERS_CACHE=/app/.cache
 
 # FastAPI port
 EXPOSE 8000
