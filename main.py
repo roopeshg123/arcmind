@@ -12,15 +12,18 @@ REST API endpoints
   POST /api/chat/stream     Streaming Q&A — Server-Sent Events (SSE)
 """
 
+import asyncio
+import functools
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,6 +33,17 @@ from ingest import run_ingestion
 from ingest.ingest_jira import ingest_jira_async, incremental_jira_sync_async
 
 DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
+
+# CORS: set CORS_ORIGINS to a comma-separated list of allowed origins.
+# Defaults to "*" (all origins) — restrict this in production.
+_CORS_ORIGINS = (
+    [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+    or ["*"]
+)
+
+# API key: set API_KEY env var to require X-API-Key on all /api/* requests.
+# Leave unset to disable auth (development only).
+_API_KEY = os.getenv("API_KEY", "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +76,22 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Enforce X-API-Key header when API_KEY env var is set."""
+    if _API_KEY:
+        path = request.url.path
+        if path not in ("/",) and not path.startswith("/static"):
+            if request.headers.get("X-API-Key", "") != _API_KEY:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -83,6 +109,19 @@ class ChatRequest(BaseModel):
     question:   str
     history:    Optional[List[ChatMessage]] = []
     session_id: Optional[str] = None        # server-side conversation memory key
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            if len(v) > 128:
+                raise ValueError("session_id must not exceed 128 characters")
+            if not re.match(r'^[a-zA-Z0-9_\-]+$', v):
+                raise ValueError(
+                    "session_id must only contain alphanumeric characters, "
+                    "hyphens, and underscores"
+                )
+        return v
 
 
 class ChatResponse(BaseModel):
@@ -136,7 +175,7 @@ async def status():
 # Routes — ingestion
 # ---------------------------------------------------------------------------
 
-_ingestion_lock = False   # simple flag to prevent concurrent runs
+_ingestion_lock: asyncio.Lock = asyncio.Lock()  # prevents concurrent ingest runs
 _ingest_progress: dict = {"stage": "idle", "fetched": 0, "total": 0, "vectors": 0}
 
 
@@ -149,8 +188,8 @@ async def ingest_progress():
 @app.post("/api/ingest")
 async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
     """Ingest Arc documentation from disk or DOCS_URL."""
-    global _ingestion_lock
-    if _ingestion_lock:
+    global _ingest_progress
+    if _ingestion_lock.locked():
         raise HTTPException(status_code=409, detail="Ingestion already in progress.")
 
     docs_dir = request.docs_dir or DOCS_DIR
@@ -164,12 +203,20 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
                 ),
             )
 
-    _ingestion_lock = True
-    try:
+    result = None
+    async with _ingestion_lock:
+        _ingest_progress = {"stage": "loading", "fetched": 0, "total": 0, "vectors": 0}
         rag_engine.reset_chain()
-        result = run_ingestion(docs_dir=docs_dir, reset=request.reset)
-    finally:
-        _ingestion_lock = False
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                functools.partial(run_ingestion, docs_dir=docs_dir, reset=request.reset),
+            )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
 
     if result.get("status") == "error":
         raise HTTPException(status_code=422, detail=result.get("message"))
@@ -180,25 +227,24 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
 @app.post("/api/ingest/jira")
 async def ingest_jira(request: JiraIngestRequest):
     """Ingest Jira issues (full or filtered by JQL)."""
-    global _ingestion_lock, _ingest_progress
-    if _ingestion_lock:
+    global _ingest_progress
+    if _ingestion_lock.locked():
         raise HTTPException(status_code=409, detail="Ingestion already in progress.")
 
-    _ingestion_lock = True
-    _ingest_progress = {"stage": "fetching", "fetched": 0, "total": 0, "vectors": 0}
     result = None
-    try:
-        result = await ingest_jira_async(
-            jql=request.jql,
-            reset=request.reset,
-            progress=_ingest_progress,
-        )
-    finally:
-        _ingestion_lock = False
-        _ingest_progress = {
-            "stage": "idle", "fetched": 0, "total": 0,
-            "vectors": result.get("vectors_stored", 0) if result else 0,
-        }
+    async with _ingestion_lock:
+        _ingest_progress = {"stage": "fetching", "fetched": 0, "total": 0, "vectors": 0}
+        try:
+            result = await ingest_jira_async(
+                jql=request.jql,
+                reset=request.reset,
+                progress=_ingest_progress,
+            )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
 
     return result
 
@@ -206,7 +252,10 @@ async def ingest_jira(request: JiraIngestRequest):
 @app.post("/api/ingest/jira/sync")
 async def jira_sync(request: JiraSyncRequest):
     """Incremental Jira sync — fetches issues updated in the last N hours."""
-    result = await incremental_jira_sync_async(hours=request.hours or 1)
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+    async with _ingestion_lock:
+        result = await incremental_jira_sync_async(hours=request.hours or 1)
     return result
 
 
@@ -233,10 +282,14 @@ async def chat(request: ChatRequest):
     history = [{"role": m.role, "content": m.content} for m in (request.history or [])]
 
     try:
-        result = rag_engine.ask(
-            question=request.question,
-            chat_history=history,
-            session_id=request.session_id,
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            functools.partial(
+                rag_engine.ask,
+                question=request.question,
+                chat_history=history,
+                session_id=request.session_id,
+            ),
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

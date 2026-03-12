@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -30,6 +31,7 @@ log = logging.getLogger(__name__)
 
 DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 DOCS_URL = os.getenv("DOCS_URL", "")
+MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "2000"))
 
 # Tags whose entire subtrees are discarded (navigation, scripts, ads…)
 _NOISE_TAGS = [
@@ -134,13 +136,20 @@ def crawl_site(base_url: str) -> list[Document]:
     })
 
     visited: set[str] = set()
-    to_visit: list[str] = [base_url]
+    to_visit: deque[str] = deque([base_url])
     documents: list[Document] = []
 
     log.info("Starting web crawl from '%s'.", base_url)
 
     while to_visit:
-        url = to_visit.pop(0).split("#")[0]
+        if len(visited) >= MAX_CRAWL_PAGES:
+            log.warning(
+                "Crawl limit reached (%d pages). "
+                "Increase MAX_CRAWL_PAGES env var to crawl more.",
+                MAX_CRAWL_PAGES,
+            )
+            break
+        url = to_visit.popleft().split("#")[0]
         if not url or url in visited or not url.startswith(base_url):
             continue
         if any(url.lower().endswith(ext) for ext in _SKIP_EXTENSIONS):

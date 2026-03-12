@@ -25,6 +25,8 @@ New additions:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import os
@@ -58,6 +60,35 @@ LOG_DIR        = os.getenv("LOG_DIR",         "./logs")
 
 os.makedirs(LOG_DIR, exist_ok=True)
 _QUERY_LOG = os.path.join(LOG_DIR, "query_log.jsonl")
+
+# Result-count tunables (env-configurable)
+_DOCS_TOP_K = int(os.getenv("DOCS_TOP_K", "6"))
+_JIRA_TOP_K = int(os.getenv("JIRA_TOP_K", "4"))
+
+# LLM singletons — created once per process to avoid per-request re-instantiation
+_llm:           ChatOpenAI | None = None
+_llm_streaming: ChatOpenAI | None = None
+
+
+def _get_llm(streaming: bool = False) -> ChatOpenAI:
+    """Return a cached ChatOpenAI instance (regular or streaming)."""
+    global _llm, _llm_streaming
+    if streaming:
+        if _llm_streaming is None:
+            _llm_streaming = ChatOpenAI(
+                model=CHAT_MODEL,
+                openai_api_key=OPENAI_API_KEY,
+                temperature=0.1,
+                streaming=True,
+            )
+        return _llm_streaming
+    if _llm is None:
+        _llm = ChatOpenAI(
+            model=CHAT_MODEL,
+            openai_api_key=OPENAI_API_KEY,
+            temperature=0.1,
+        )
+    return _llm
 
 # ---------------------------------------------------------------------------
 # Backward-compatible status / lifecycle helpers (called by main.py)
@@ -108,7 +139,10 @@ class _DirectChain:
 
 
 def reset_chain() -> None:
-    """Release all cached objects (ChromaDB handles, BM25 index, etc.)."""
+    """Release all cached objects (ChromaDB handles, BM25 index, LLM, etc.)."""
+    global _llm, _llm_streaming
+    _llm           = None
+    _llm_streaming = None
     reset_store()
 
 
@@ -211,19 +245,19 @@ def _run_pipeline(
         log.info("Direct ticket fetch: %s", route.ticket_ids)
         jira_docs     = get_store().get_jira_by_tickets(route.ticket_ids)
         docs, _       = retrieve_docs_and_jira(
-            [question], docs_k=6, jira_k=0, connector_filter=connector
+            [question], docs_k=_DOCS_TOP_K, jira_k=0, connector_filter=connector
         )
     else:
         docs, jira_docs = retrieve_docs_and_jira(
-            expanded, docs_k=6, jira_k=4, connector_filter=connector
+            expanded, docs_k=_DOCS_TOP_K, jira_k=_JIRA_TOP_K, connector_filter=connector
         )
 
     # 5. Rerank combined pool (keep source split afterwards)
     combined = docs + jira_docs
     if combined:
-        reranked  = rerank(question, combined, top_n=RERANKER_TOP_N + 3)
-        docs      = [d for d in reranked if d.metadata.get("source") != "jira"][:6]
-        jira_docs = [d for d in reranked if d.metadata.get("source") == "jira"][:4]
+        reranked  = rerank(question, combined, top_n=_DOCS_TOP_K + _JIRA_TOP_K)
+        docs      = [d for d in reranked if d.metadata.get("source") != "jira"][:_DOCS_TOP_K]
+        jira_docs = [d for d in reranked if d.metadata.get("source") == "jira"][:_JIRA_TOP_K]
 
     return docs, jira_docs, expanded, chat_history
 
@@ -288,11 +322,7 @@ def ask(
 
     messages = build_messages(question, docs, jira_docs, history)
 
-    llm = ChatOpenAI(
-        model=CHAT_MODEL,
-        openai_api_key=OPENAI_API_KEY,
-        temperature=0.1,
-    )
+    llm = _get_llm()
 
     try:
         response = llm.invoke(messages)
@@ -350,18 +380,17 @@ async def ask_stream(
 
     question = _normalize_question(question)
 
-    docs, jira_docs, expanded, history = _run_pipeline(
-        question, session_id=session_id, chat_history=chat_history
+    loop = asyncio.get_event_loop()
+    docs, jira_docs, expanded, history = await loop.run_in_executor(
+        None,
+        functools.partial(
+            _run_pipeline, question, session_id=session_id, chat_history=chat_history
+        ),
     )
 
     messages = build_messages(question, docs, jira_docs, history)
 
-    llm = ChatOpenAI(
-        model=CHAT_MODEL,
-        openai_api_key=OPENAI_API_KEY,
-        temperature=0.1,
-        streaming=True,
-    )
+    llm = _get_llm(streaming=True)
 
     tokens: list[str] = []
     try:

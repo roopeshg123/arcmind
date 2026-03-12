@@ -60,8 +60,8 @@ class ChromaStore:
         # BM25 — loaded lazily from disk
         self._bm25_docs:   Any = None
         self._bm25_jira:   Any = None
-        self._corpus_docs: list[tuple[str, str]] = []   # (chroma_id, text)
-        self._corpus_jira: list[tuple[str, str]] = []
+        self._corpus_docs: list[tuple[str, str, dict]] = []   # (chroma_id, text, metadata)
+        self._corpus_jira: list[tuple[str, str, dict]] = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -138,10 +138,15 @@ class ChromaStore:
     # BM25 index management
     # ------------------------------------------------------------------
 
-    def _build_bm25(self, collection_name: str) -> None:
+    def _build_bm25(self, collection_name: str, new_docs: list[Document] | None = None) -> None:
         """
-        Build a BM25Okapi index from all texts in *collection_name* and save it
-        alongside the ChromaDB files.  The index is also cached in memory.
+        Build or incrementally extend the BM25 index.
+
+        If *new_docs* is provided and an in-memory corpus already exists, extends
+        the corpus with the new documents instead of fetching all documents from
+        ChromaDB.  This avoids an expensive full-collection scan on every
+        incremental Jira sync.  Falls back to a full rebuild when no cached
+        corpus is available (e.g. cold start after restart).
         """
         try:
             from rank_bm25 import BM25Okapi
@@ -149,30 +154,39 @@ class ChromaStore:
             log.warning("rank_bm25 not installed — BM25 indexing skipped.")
             return
 
-        store = self._get_store(collection_name)
-        pkl_path = _BM25_DOCS_PKL if collection_name == DOCS_COLLECTION else _BM25_JIRA_PKL
+        pkl_path      = _BM25_DOCS_PKL if collection_name == DOCS_COLLECTION else _BM25_JIRA_PKL
+        is_docs       = (collection_name == DOCS_COLLECTION)
+        cached_corpus = self._corpus_docs if is_docs else self._corpus_jira
 
         try:
-            raw = store._collection.get(include=["documents", "metadatas"])
-            texts:     list[str]  = raw.get("documents") or []
-            ids:       list[str]  = raw.get("ids")       or []
-            metadatas: list[dict] = raw.get("metadatas") or [{}] * len(texts)
+            if new_docs is not None and cached_corpus:
+                # Append path — extend cached corpus without a ChromaDB roundtrip
+                new_entries: list[tuple[str, str, dict]] = [
+                    ("", doc.page_content, doc.metadata) for doc in new_docs
+                ]
+                corpus = cached_corpus + new_entries
+            else:
+                # Full-rebuild path — fetch all documents from ChromaDB
+                store     = self._get_store(collection_name)
+                raw       = store._collection.get(include=["documents", "metadatas"])
+                texts:     list[str]  = raw.get("documents") or []
+                ids:       list[str]  = raw.get("ids")       or []
+                metadatas: list[dict] = raw.get("metadatas") or [{}] * len(texts)
 
-            if not texts:
-                log.warning("No texts for BM25 index in '%s'.", collection_name)
-                return
+                if not texts:
+                    log.warning("No texts for BM25 index in '%s'.", collection_name)
+                    return
 
-            tokenized = [t.lower().split() for t in texts]
+                corpus = list(zip(ids, texts, metadatas))
+
+            tokenized = [entry[1].lower().split() for entry in corpus]
             bm25      = BM25Okapi(tokenized)
-            # Store (id, text, metadata) so ticket IDs survive BM25 retrieval
-            corpus    = list(zip(ids, texts, metadatas))
 
             os.makedirs(CHROMA_DB_DIR, exist_ok=True)
             with open(pkl_path, "wb") as fh:
                 pickle.dump({"bm25": bm25, "corpus": corpus}, fh)
 
-            # Cache in memory
-            if collection_name == DOCS_COLLECTION:
+            if is_docs:
                 self._bm25_docs   = bm25
                 self._corpus_docs = corpus
             else:
@@ -181,12 +195,12 @@ class ChromaStore:
 
             log.info(
                 "BM25 index built for '%s': %d docs → '%s'.",
-                collection_name, len(texts), pkl_path,
+                collection_name, len(corpus), pkl_path,
             )
         except Exception as exc:
             log.error("BM25 build failed for '%s': %s", collection_name, exc)
 
-    def _load_bm25(self, collection_name: str) -> tuple[Any, list[tuple[str, str]]]:
+    def _load_bm25(self, collection_name: str) -> tuple[Any, list[tuple[str, str, dict]]]:
         """Return (bm25, corpus) — loads from disk if not yet in memory."""
         if collection_name == DOCS_COLLECTION:
             if self._bm25_docs is not None:
@@ -201,8 +215,7 @@ class ChromaStore:
             return None, []
 
         try:
-            with open(pkl_path, "rb") as fh:
-                data = pickle.load(fh)
+            data   = _safe_pickle_load(pkl_path)
             bm25   = data["bm25"]
             corpus = data["corpus"]
 
@@ -233,7 +246,7 @@ class ChromaStore:
         count = store._collection.count()
         log.info("Docs collection: %d vectors.", count)
 
-        self._build_bm25(DOCS_COLLECTION)
+        self._build_bm25(DOCS_COLLECTION, new_docs=None if reset else chunks)
         return count
 
     def add_jira_batch(self, chunks: list[Document], reset: bool = False) -> int:
@@ -246,7 +259,8 @@ class ChromaStore:
         count = store._collection.count()
         log.info("Jira collection: %d vectors.", count)
 
-        self._build_bm25(JIRA_COLLECTION)
+        # Pass new chunks for append mode to avoid a full ChromaDB scan
+        self._build_bm25(JIRA_COLLECTION, new_docs=None if reset else chunks)
         return count
 
     # ------------------------------------------------------------------
@@ -391,6 +405,21 @@ def _clear_chroma_cache() -> None:
         SharedSystemClient.clear_system_cache()
     except Exception:
         pass
+
+
+def _safe_pickle_load(path: str) -> Any:
+    """
+    Load a pickle file after verifying the path lies within CHROMA_DB_DIR.
+    Defends against path-traversal if the path were ever user-influenced.
+    """
+    abs_path = os.path.realpath(path)
+    abs_base = os.path.realpath(CHROMA_DB_DIR)
+    if not (abs_path == abs_base or abs_path.startswith(abs_base + os.sep)):
+        raise ValueError(
+            f"Refusing to load pickle file outside data directory: '{path}'"
+        )
+    with open(abs_path, "rb") as fh:
+        return pickle.load(fh)  # noqa: S301 — path is validated above
 
 
 # ---------------------------------------------------------------------------

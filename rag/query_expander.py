@@ -24,6 +24,21 @@ log = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 FAST_MODEL     = "gpt-4o-mini"   # fast/cheap model for expansion
 
+_expansion_llm = None   # lazy singleton
+
+
+def _get_expansion_llm():
+    """Return a cached ChatOpenAI instance for query expansion."""
+    global _expansion_llm
+    if _expansion_llm is None:
+        from langchain_openai import ChatOpenAI
+        _expansion_llm = ChatOpenAI(
+            model=FAST_MODEL,
+            openai_api_key=OPENAI_API_KEY,
+            temperature=0,
+        )
+    return _expansion_llm
+
 _SYSTEM_PROMPT = (
     "You are a search-query expert for the CData Arc enterprise integration "
     "platform (also called ArcESB). Your job is to expand a user question into "
@@ -51,14 +66,9 @@ def expand_with_llm(query: str) -> list[str]:
     Falls back to [query] on any error so the pipeline is never blocked.
     """
     try:
-        from langchain_openai import ChatOpenAI
         from langchain_core.prompts import ChatPromptTemplate
 
-        llm = ChatOpenAI(
-            model=FAST_MODEL,
-            openai_api_key=OPENAI_API_KEY,
-            temperature=0,
-        )
+        llm    = _get_expansion_llm()
         prompt = ChatPromptTemplate.from_messages([
             ("system", _SYSTEM_PROMPT),
             ("human", "Question: {query}"),
