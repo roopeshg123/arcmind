@@ -1,126 +1,361 @@
 """
-RAG Engine — handles vector store loading, retrieval, and LLM chain execution.
+ArcMind RAG Engine
+
+Orchestrates the full retrieval-augmented generation pipeline:
+
+  1. Query routing      — detect Jira ticket IDs
+  2. Connector detection — identify which Arc connector is being asked about
+  3. Query expansion    — generate semantically related search queries
+  4. Hybrid retrieval   — vector search + BM25 from docs and Jira collections
+  5. Reranking          — cross-encoder re-scores the candidate pool
+  6. Prompt building    — inject docs + clustered Jira context into the prompt
+  7. LLM invocation     — streaming or blocking GPT-4.1 call
+  8. Memory             — server-side per-session conversation history
+  9. Query logging      — append to JSONL file for self-improvement analysis
+
+Backward-compatible API
+-----------------------
+The public functions used by main.py are preserved:
+    is_vector_store_ready(), load_vector_store(), get_rag_chain(),
+    warmup_reranker(), reset_chain(), ask(question, chat_history)
+New additions:
+    ask(…, session_id)   — server-side memory
+    ask_stream(…)        — async generator for SSE streaming
 """
 
+from __future__ import annotations
+
+import json
+import logging
 import os
-import re
-from pathlib import Path
-from typing import List, Dict, Any
+import time
+from typing import Any, AsyncGenerator
 
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_chroma import Chroma
-from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_openai import ChatOpenAI
+
+from rag.connector_detector  import detect_connector
+from rag.conversation_memory import get_memory
+from rag.prompt_builder      import build_messages
+from rag.query_expander      import expand_query
+from rag.query_router        import route_query
+from rag.reranker            import rerank, warmup
+from rag.retriever           import retrieve_docs_and_jira
+from vector_db.chroma_store  import get_store, reset_store
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
-CHAT_MODEL       = os.getenv("CHAT_MODEL", "gpt-4o-mini")
-EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-CHROMA_DB_DIR    = os.getenv("CHROMA_DB_DIR", "./chroma_db")
-RETRIEVER_TOP_K  = int(os.getenv("RETRIEVER_TOP_K", "8"))
-RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
-RERANKER_MODEL   = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-RERANKER_TOP_N   = int(os.getenv("RERANKER_TOP_N", "8"))
+log = logging.getLogger(__name__)
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+CHAT_MODEL     = os.getenv("CHAT_MODEL",     "gpt-4.1")
+CHROMA_DB_DIR  = os.getenv("CHROMA_DB_DIR",  "./chroma_db")
+RERANKER_TOP_N = int(os.getenv("RERANKER_TOP_N", "5"))
+LOG_DIR        = os.getenv("LOG_DIR",         "./logs")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+_QUERY_LOG = os.path.join(LOG_DIR, "query_log.jsonl")
 
 # ---------------------------------------------------------------------------
-# Singleton components (loaded once at startup)
+# Backward-compatible status / lifecycle helpers (called by main.py)
 # ---------------------------------------------------------------------------
-_embeddings: OpenAIEmbeddings | None = None
-_vector_store: Chroma | None = None
-_rag_chain: Any = None
-_reranker: CrossEncoderReranker | None = None
+
+class _CollectionProxy:
+    """Lets main.py call vs._collection.count() without change."""
+    def __init__(self, store) -> None:
+        self._store = store
+
+    def count(self) -> int:
+        return self._store.docs_count() + self._store.jira_count()
 
 
-def _get_embeddings() -> OpenAIEmbeddings:
-    global _embeddings
-    if _embeddings is None:
-        _embeddings = OpenAIEmbeddings(
-            model=EMBEDDING_MODEL,
-            openai_api_key=OPENAI_API_KEY,
-        )
-    return _embeddings
-
-
-def _get_reranker() -> CrossEncoderReranker:
-    """Lazy-load the cross-encoder reranker (downloads model on first call)."""
-    global _reranker
-    if _reranker is None:
-        print(f"[reranker] Loading cross-encoder model: {RERANKER_MODEL}")
-        encoder = HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
-        _reranker = CrossEncoderReranker(model=encoder, top_n=RERANKER_TOP_N)
-        print(f"[reranker] Ready — will re-score candidates and keep top {RERANKER_TOP_N}.")
-    return _reranker
-
-
-def warmup_reranker() -> None:
-    """Pre-load the reranker model into memory so the first request pays no cold-start cost."""
-    if RERANKER_ENABLED:
-        _get_reranker()
-
-
-def load_vector_store() -> Chroma:
-    """Load an existing ChromaDB vector store from disk."""
-    global _vector_store
-    _vector_store = Chroma(
-        persist_directory=CHROMA_DB_DIR,
-        embedding_function=_get_embeddings(),
-    )
-    return _vector_store
-
-
-def release_vector_store() -> None:
-    """Release the in-memory ChromaDB client so its file handles are freed.
-    Must be called before deleting chroma_db/ on Windows to avoid WinError 32."""
-    global _vector_store, _rag_chain
-    _rag_chain = None
-    _vector_store = None
-    import gc
-    gc.collect()
-    # ChromaDB uses an internal singleton — clear it to release the SQLite file lock
-    try:
-        from chromadb.api.client import SharedSystemClient
-        SharedSystemClient.clear_system_cache()
-    except Exception:
-        pass
+class _StoreProxy:
+    """Thin wrapper returned by load_vector_store() for main.py compatibility."""
+    def __init__(self, store) -> None:
+        self._collection = _CollectionProxy(store)
 
 
 def is_vector_store_ready() -> bool:
-    """Return True if ChromaDB directory exists and contains documents."""
-    if not os.path.isdir(CHROMA_DB_DIR):
-        return False
+    """Return True if the docs collection has at least one vector."""
+    return get_store().is_docs_ready()
+
+
+def load_vector_store() -> _StoreProxy:
+    """Return a proxy with ._collection.count() for the /api/status endpoint."""
+    return _StoreProxy(get_store())
+
+
+def release_vector_store() -> None:
+    """Release ChromaDB handles (Windows file-lock safety)."""
+    reset_store()
+
+
+def warmup_reranker() -> None:
+    """Pre-load the cross-encoder reranker to eliminate cold-start latency."""
+    warmup()
+
+
+def get_rag_chain():
+    """Backward-compat stub — the new engine does not use a LangChain chain object."""
+    return _DirectChain()
+
+
+class _DirectChain:
+    """Truthy placeholder so existing `if get_rag_chain()` checks still pass."""
+
+
+def reset_chain() -> None:
+    """Release all cached objects (ChromaDB handles, BM25 index, etc.)."""
+    reset_store()
+
+
+# ---------------------------------------------------------------------------
+# Query-level logging (self-improvement)
+# ---------------------------------------------------------------------------
+
+def _log_query(
+    question:        str,
+    expanded:        list[str],
+    n_docs:          int,
+    n_jira:          int,
+    answer_preview:  str,
+) -> None:
+    """Append a structured query record to the JSONL log file."""
     try:
-        vs = load_vector_store()
-        count = vs._collection.count()
-        return count > 0
-    except Exception:
-        return False
+        entry = {
+            "ts":              time.time(),
+            "question":        question,
+            "expanded_queries": expanded,
+            "docs_retrieved":  n_docs,
+            "jira_retrieved":  n_jira,
+            "answer_preview":  answer_preview[:500],
+        }
+        with open(_QUERY_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        log.warning("Query log write failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# RAG chain construction
+# Path-in-question normaliser (kept from v1 for backward compat)
 # ---------------------------------------------------------------------------
 
-def _build_rag_chain(vector_store: Chroma):
-    """
-    Build a history-aware retrieval chain with a document QA chain.
+import re
+from pathlib import Path as _Path
 
-    Two-step architecture:
-      1. contextualize_q_chain  — rewrites the user question using chat history
-                                   so the retriever always receives a standalone query.
-      2. question_answer_chain  — stuffs retrieved docs into the prompt and asks
-                                   the LLM to answer grounded in the context.
+
+def _extract_topic_from_path(text: str) -> str | None:
+    pattern = r'(?:file:///|file://)?[A-Za-z]:[\\//][^\s"<>]+\.html|[^\s"<>]+\.html'
+    m = re.search(pattern, text, re.IGNORECASE)
+    if not m:
+        return None
+    raw  = m.group(0)
+    stem = _Path(re.sub(r'file:///|file://', '', raw).replace('%20', ' ')).stem
+    stem = re.sub(r'^op_', '', stem)
+    words = re.sub(r'([a-z])([A-Z])', r'\1 \2', stem)
+    words = re.sub(r'[-_]', ' ', words)
+    return f"{stem} {words} Arc operation connector documentation"
+
+
+def _normalize_question(question: str) -> str:
+    """Rewrite pasted file paths / URLs into searchable topic strings."""
+    topic = _extract_topic_from_path(question)
+    if topic is None:
+        return question
+    cleaned = re.sub(
+        r'(?:file:///|file://)?[A-Za-z]:[\\//][^\s"<>]+\.html|[^\s"<>]+\.html',
+        '', question, flags=re.IGNORECASE,
+    ).strip()
+    return f"{cleaned} — topic: {topic}" if cleaned else f"Explain {topic} in detail"
+
+
+# ---------------------------------------------------------------------------
+# Core retrieval pipeline (shared by ask() and ask_stream())
+# ---------------------------------------------------------------------------
+
+def _run_pipeline(
+    question:     str,
+    session_id:   str | None,
+    chat_history: list[dict],
+) -> tuple[list, list, list[str], list[dict]]:
     """
+    Execute routing → connector detection → expansion → hybrid retrieval → rerank.
+
+    Returns:
+        (docs, jira_docs, expanded_queries, effective_chat_history)
+    """
+    # Merge server-side memory with any client-provided history
+    if session_id:
+        memory  = get_memory()
+        stored  = memory.get_history(session_id)
+        if stored and not chat_history:
+            chat_history = stored
+
+    # 1. Detect connector
+    connector = detect_connector(question)
+    if connector:
+        log.info("Connector detected: %s", connector)
+
+    # 2. Route
+    route = route_query(question)
+
+    # 3. Expand
+    expanded = expand_query(question, connector=connector)
+    log.info("Query expansion: %d variant(s).", len(expanded))
+
+    # 4. Retrieve
+    if route.strategy == "ticket_direct" and route.ticket_ids:
+        log.info("Direct ticket fetch: %s", route.ticket_ids)
+        jira_docs     = get_store().get_jira_by_tickets(route.ticket_ids)
+        docs, _       = retrieve_docs_and_jira(
+            [question], docs_k=6, jira_k=0, connector_filter=connector
+        )
+    else:
+        docs, jira_docs = retrieve_docs_and_jira(
+            expanded, docs_k=6, jira_k=4, connector_filter=connector
+        )
+
+    # 5. Rerank combined pool (keep source split afterwards)
+    combined = docs + jira_docs
+    if combined:
+        reranked  = rerank(question, combined, top_n=RERANKER_TOP_N + 3)
+        docs      = [d for d in reranked if d.metadata.get("source") != "jira"][:6]
+        jira_docs = [d for d in reranked if d.metadata.get("source") == "jira"][:4]
+
+    return docs, jira_docs, expanded, chat_history
+
+
+def _build_sources(docs: list, jira_docs: list) -> list[dict]:
+    """Build the deduplicated sources list returned to the client."""
+    seen: set[str] = set()
+    sources: list[dict] = []
+    for doc in docs + jira_docs:
+        key = (
+            doc.metadata.get("file_path")
+            or doc.metadata.get("url")
+            or doc.metadata.get("ticket")
+            or "unknown"
+        )
+        if key not in seen:
+            seen.add(key)
+            sources.append({
+                "source":  key,
+                "type":    doc.metadata.get("source",    "unknown"),
+                "section": doc.metadata.get("section",   ""),
+                "ticket":  doc.metadata.get("ticket",    ""),
+                "content": doc.page_content[:300] + (
+                    "..." if len(doc.page_content) > 300 else ""
+                ),
+            })
+    return sources
+
+
+# ---------------------------------------------------------------------------
+# Public blocking API
+# ---------------------------------------------------------------------------
+
+def ask(
+    question:     str,
+    chat_history: list[dict] | None = None,
+    session_id:   str | None = None,
+) -> dict[str, Any]:
+    """
+    Run a full RAG query and return the answer (blocking).
+
+    Args:
+        question:     The user's question.
+        chat_history: Prior turns as [{"role": "user"|"assistant", "content": "…"}].
+        session_id:   Optional session ID for server-side conversation memory.
+
+    Returns:
+        {
+            "answer":      str,
+            "sources":     list[dict],
+            "jira_issues": list[dict],
+        }
+    """
+    if chat_history is None:
+        chat_history = []
+
+    question = _normalize_question(question)
+
+    docs, jira_docs, expanded, history = _run_pipeline(
+        question, session_id=session_id, chat_history=chat_history
+    )
+
+    messages = build_messages(question, docs, jira_docs, history)
+
+    llm = ChatOpenAI(
+        model=CHAT_MODEL,
+        openai_api_key=OPENAI_API_KEY,
+        temperature=0.1,
+    )
+
+    try:
+        response = llm.invoke(messages)
+        answer   = response.content
+    except Exception as exc:
+        log.error("LLM call failed: %s", exc)
+        raise
+
+    # Persist to server-side memory
+    if session_id:
+        get_memory().add_turn(session_id, question, answer)
+
+    _log_query(question, expanded, len(docs), len(jira_docs), answer)
+
+    jira_issues = [
+        {
+            "ticket":    d.metadata.get("ticket",    ""),
+            "status":    d.metadata.get("status",    ""),
+            "component": d.metadata.get("component", ""),
+        }
+        for d in jira_docs if d.metadata.get("ticket")
+    ]
+
+    return {
+        "answer":      answer,
+        "sources":     _build_sources(docs, jira_docs),
+        "jira_issues": jira_issues,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public streaming API
+# ---------------------------------------------------------------------------
+
+async def ask_stream(
+    question:     str,
+    chat_history: list[dict] | None = None,
+    session_id:   str | None = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream the RAG answer as Server-Sent Events.
+
+    Each yield is an SSE-formatted string:
+        "data: {…JSON…}\n\n"
+
+    Event types:
+        {"token":  "…"}           — incremental answer token
+        {"error":  "…"}           — error (stream ends)
+        {"done": true,
+         "sources": […],
+         "jira_issues": […]}      — final metadata event
+    """
+    if chat_history is None:
+        chat_history = []
+
+    question = _normalize_question(question)
+
+    docs, jira_docs, expanded, history = _run_pipeline(
+        question, session_id=session_id, chat_history=chat_history
+    )
+
+    messages = build_messages(question, docs, jira_docs, history)
+
     llm = ChatOpenAI(
         model=CHAT_MODEL,
         openai_api_key=OPENAI_API_KEY,
@@ -128,238 +363,32 @@ def _build_rag_chain(vector_store: Chroma):
         streaming=True,
     )
 
-    # When reranking is enabled MMR fetches 2× more candidates so the
-    # cross-encoder has a richer pool to re-score and select the best from.
-    mmr_k = RETRIEVER_TOP_K * 2 if RERANKER_ENABLED else RETRIEVER_TOP_K
-    retriever = vector_store.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": mmr_k, "fetch_k": mmr_k * 5},
-    )
-    if RERANKER_ENABLED:
-        retriever = ContextualCompressionRetriever(
-            base_compressor=_get_reranker(),
-            base_retriever=retriever,
-        )
+    tokens: list[str] = []
+    try:
+        async for chunk in llm.astream(messages):
+            token = chunk.content
+            if token:
+                tokens.append(token)
+                yield f"data: {json.dumps({'token': token})}\n\n"
+    except Exception as exc:
+        log.error("LLM streaming error: %s", exc)
+        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+        return
 
-    # -- Step 1: contextualise + expand the question -------------------------
-    # This prompt does two jobs:
-    #   a) resolves references from history ("it", "that connector", etc.)
-    #   b) expands vague/short queries so the retriever finds more relevant chunks
-    #      e.g. "Explain AS2" → "AS2 connector configuration Arc integration protocol"
-    contextualize_q_system_prompt = (
-        "You are a search query expert. Given the chat history and the user's latest "
-        "question, do the following:\n"
-        "1. If the question references something from history (e.g. 'it', 'that', "
-        "'the connector'), replace those references with explicit terms.\n"
-        "2. If the question is short or vague (e.g. 'Explain AS2', 'What is SFTP'), "
-        "expand it into a richer search query by adding related technical terms, "
-        "synonyms, and context words that would appear in documentation.\n"
-        "   Example: 'Explain AS2' → 'AS2 connector configuration setup Arc "
-        "integration EDI protocol send receive'\n"
-        "3. Return ONLY the rewritten search query. Do NOT answer the question."
-    )
-    contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", contextualize_q_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
-    )
+    answer = "".join(tokens)
 
-    # -- Step 2: answer using retrieved docs + LLM's own knowledge -----------
-    qa_system_prompt = (
-        "You are an expert technical assistant specialising in the Arc integration "
-        "platform. You have two sources of knowledge:\n"
-        "  1. The Arc DOCUMENTATION provided below (primary source).\n"
-        "  2. Your own general technical knowledge (secondary — used only to enrich).\n\n"
-        "STRICT RULES — follow these in order:\n\n"
-        "RULE 1 — EXAMPLES:\n"
-        "  If an example, sample code, or script exists in the DOCUMENTATION CONTEXT,\n"
-        "  you MUST copy it EXACTLY, word-for-word, character-for-character.\n"
-        "  Do NOT rewrite it, paraphrase it, or 'improve' it.\n"
-        "  After showing the exact doc example, you may then explain it and optionally\n"
-        "  add a clearly labelled supplementary example.\n"
-        "  NEVER invent or generate code for Arc-specific syntax (ArcScript, arc:set,\n"
-        "  arc:call, etc.) from your own knowledge — Arc's syntax must come from the docs.\n\n"
-        "RULE 2 — PARAMETERS & ATTRIBUTES:\n"
-        "  Always list parameters, attributes, and field names exactly as they appear\n"
-        "  in the documentation. Do not guess or rename them.\n\n"
-        "RULE 3 — EXPLANATIONS:\n"
-        "  After presenting the exact doc content, you MAY add:\n"
-        "  - Plain-English explanation of what each part does\n"
-        "  - General background (e.g. what BASE64 is, what SFTP is)\n"
-        "  - Real-world use cases and analogies\n"
-        "  - Comparisons with similar standards/protocols\n"
-        "  Clearly label any content that comes from your own knowledge vs the docs.\n\n"
-        "RULE 4 — MISSING CONTENT:\n"
-        "  Only say 'not found in documentation' if the topic is completely absent\n"
-        "  from the retrieved context AND unrelated to Arc or integration platforms.\n\n"
-        "RULE 5 — STRUCTURE:\n"
-        "  Use clear headings, bullet points, numbered steps, and fenced code blocks.\n"
-        "  For code, always specify the language tag (xml, json, python, etc.).\n\n"
-        "--- ARC DOCUMENTATION CONTEXT ---\n"
-        "{context}"
-    )
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", qa_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    if session_id:
+        get_memory().add_turn(session_id, question, answer)
 
-    return create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    _log_query(question, expanded, len(docs), len(jira_docs), answer)
 
+    jira_issues = [
+        {
+            "ticket":    d.metadata.get("ticket",    ""),
+            "status":    d.metadata.get("status",    ""),
+            "component": d.metadata.get("component", ""),
+        }
+        for d in jira_docs if d.metadata.get("ticket")
+    ]
 
-def get_rag_chain():
-    """Return the cached RAG chain, building it if necessary."""
-    global _rag_chain, _vector_store
-    if _rag_chain is None:
-        if _vector_store is None:
-            load_vector_store()
-        _rag_chain = _build_rag_chain(_vector_store)
-    return _rag_chain
-
-
-# ---------------------------------------------------------------------------
-# Public API used by the FastAPI routes
-# ---------------------------------------------------------------------------
-
-# Readable labels for common op_ filename prefixes
-_OP_PREFIX_MAP = {
-    "enc": "encoding",
-    "db":  "database",
-    "file": "file",
-    "http": "HTTP",
-    "json": "JSON",
-    "xml":  "XML",
-    "zip":  "ZIP",
-    "sys":  "system",
-    "msg":  "message",
-    "crypto": "crypto",
-    "thread": "thread",
-    "flow":   "flow",
-    "integrity": "integrity",
-}
-
-
-def _extract_topic_from_path(text: str) -> str | None:
-    """
-    If the text contains a file path or file:// URL, extract the HTML filename
-    and convert it into a human-readable topic string.
-
-    Examples:
-      file:///D:/Arc.help.AZN/mft/op_encDecode.html
-          → "encDecode encode decode operation Arc"
-      D:\\Arc.help.AZN\\mft\\SFTP.html
-          → "SFTP"
-      op_HTTPGet.html
-          → "HTTPGet HTTP GET operation Arc"
-    """
-    # Match file:// URLs or Windows/Unix absolute paths containing .html
-    pattern = r'(?:file:///|file://)?[A-Za-z]:[\\//][^\s"<>]+\.html|[^\s"<>]+\.html'
-    match = re.search(pattern, text, re.IGNORECASE)
-    if not match:
-        return None
-
-    # Get just the filename without extension
-    raw = match.group(0)
-    stem = Path(re.sub(r'file:///|file://', '', raw).replace('%20', ' ')).stem
-    # e.g. "op_encDecode", "SFTP", "REST"
-
-    # Remove op_ prefix and split on camelCase / underscores / hyphens
-    stem = re.sub(r'^op_', '', stem)
-    words = re.sub(r'([a-z])([A-Z])', r'\1 \2', stem)  # camelCase split
-    words = re.sub(r'[-_]', ' ', words)
-
-    return f"{stem} {words} Arc operation connector documentation"
-
-
-def _normalize_question(question: str) -> str:
-    """
-    Pre-process the user question before it enters the RAG chain.
-
-    - If it contains a file path or URL, extract the topic and rewrite
-      the question so it searches for that topic instead of the raw path.
-    - Otherwise return the question unchanged.
-    """
-    topic = _extract_topic_from_path(question)
-    if topic is None:
-        return question
-
-    # Remove the raw path/URL from the question text
-    cleaned = re.sub(
-        r'(?:file:///|file://)?[A-Za-z]:[\\//][^\s"<>]+\.html|[^\s"<>]+\.html',
-        '',
-        question,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    # Build a clean question: keep whatever the user typed plus the extracted topic
-    if cleaned:
-        # e.g. "in this path there is a description" + topic
-        rewritten = f"{cleaned} — topic: {topic}"
-    else:
-        rewritten = f"Explain {topic} in detail with examples"
-
-    return rewritten
-
-
-def convert_chat_history(raw_history: List[Dict[str, str]]):
-    """Convert [{role, content}] list to LangChain message objects."""
-    messages = []
-    for msg in raw_history:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            messages.append(AIMessage(content=msg["content"]))
-    return messages
-
-
-def ask(question: str, chat_history: List[Dict[str, str]] = None) -> Dict[str, Any]:
-    """
-    Run a RAG query.
-
-    Args:
-        question:     The user's question.
-        chat_history: Previous turns as [{"role": "user"|"assistant", "content": "..."}].
-
-    Returns:
-        {"answer": str, "sources": [{"source": str, "content": str}]}
-    """
-    if chat_history is None:
-        chat_history = []
-
-    # Normalize: convert any pasted file paths/URLs into searchable topic queries
-    question = _normalize_question(question)
-
-    chain = get_rag_chain()
-    lc_history = convert_chat_history(chat_history)
-
-    result = chain.invoke({"input": question, "chat_history": lc_history})
-
-    # Deduplicate source documents
-    seen_sources = set()
-    sources = []
-    for doc in result.get("context", []):
-        src = doc.metadata.get("source", "Unknown")
-        if src not in seen_sources:
-            seen_sources.add(src)
-            sources.append({
-                "source": src,
-                "content": doc.page_content[:300] + ("..." if len(doc.page_content) > 300 else ""),
-            })
-
-    return {
-        "answer": result["answer"],
-        "sources": sources,
-    }
-
-
-def reset_chain():
-    """Release all cached objects so file handles are freed (important on Windows)."""
-    global _rag_chain, _vector_store
-    _rag_chain = None
-    _vector_store = None
-    import gc
-    gc.collect()
+    yield f"data: {json.dumps({'done': True, 'sources': _build_sources(docs, jira_docs), 'jira_issues': jira_issues})}\n\n"

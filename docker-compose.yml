@@ -15,12 +15,15 @@ services:
       # DOCS_DIR is set to in .env (which is the Windows host path).
       - CHROMA_DB_DIR=/app/chroma_db
       - DOCS_DIR=/app/docs
+      - LOG_DIR=/app/logs
     volumes:
       # Mount the Windows docs folder into the container (used when DOCS_DIR is set in .env).
       # If you are using DOCS_URL instead, this mounts an empty ./docs folder — harmless.
       - ${DOCS_DIR:-./docs}:/app/docs:ro
       # Persist the vector store across container restarts
       - chroma_data:/app/chroma_db
+      # Persist query logs across container restarts
+      - logs_data:/app/logs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/status')"]
@@ -31,4 +34,6 @@ services:
 
 volumes:
   chroma_data:
+    driver: local
+  logs_data:
     driver: local
