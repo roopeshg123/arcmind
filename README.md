@@ -22,7 +22,7 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 | `rag/engine.py` | Top-level RAG pipeline gluing all components |
 | `vector_db/chroma_store.py` | ChromaDB + BM25 store (two collections) |
 | `static/index.html` | Chat UI served by the backend |
-| `.env.example` | Config template — copy to `.env` and fill in values |
+| `.env` | Config template — fill in your values (placeholder values committed; real values stay local) |
 | `Dockerfile` | Two-stage container image definition |
 | `docker-compose.yml` | Run the full app with one command |
 | `chroma_db/` | Vector store — auto-created after first indexing |
@@ -82,8 +82,9 @@ pip install -r requirements.txt
 
 ### Step 4 — Configure your `.env` file
 
+The `.env` file is already in the repo with placeholder values. Just open it and fill in your real values:
+
 ```powershell
-copy .env.example .env
 notepad .env
 ```
 
@@ -135,7 +136,6 @@ No Python installation needed on team machines.
 ```bash
 git clone https://github.com/YOUR_USERNAME/arcmind.git
 cd arcmind
-copy .env.example .env
 notepad .env
 ```
 
