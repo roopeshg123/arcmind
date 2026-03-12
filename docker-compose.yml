@@ -16,6 +16,12 @@ services:
       - CHROMA_DB_DIR=/app/chroma_db
       - DOCS_DIR=/app/docs
       - LOG_DIR=/app/logs
+      # Jira — these are read from .env automatically via env_file above.
+      # Listed here so the container gets them even if .env is missing them.
+      - JIRA_BASE_URL=${JIRA_BASE_URL:-}
+      - JIRA_EMAIL=${JIRA_EMAIL:-}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
+      - JIRA_PROJECT_KEY=${JIRA_PROJECT_KEY:-}
     volumes:
       # Mount the Windows docs folder into the container (used when DOCS_DIR is set in .env).
       # If you are using DOCS_URL instead, this mounts an empty ./docs folder — harmless.

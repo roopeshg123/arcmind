@@ -4,6 +4,9 @@ chroma_db/
 # Local docs folder (can be large — teammates bring their own copy)
 docs/
 
+# Secrets — NEVER commit the real .env
+.env
+
 # Python
 __pycache__/
 *.py[cod]

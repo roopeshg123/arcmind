@@ -89,9 +89,11 @@ def hybrid_search(
     """
     store = get_store()
 
-    # Build optional metadata filter for connector-aware retrieval
+    # Docs use "section" metadata; Jira uses "component".
+    # Only apply the filter to Jira — doc sections are not reliably populated
+    # for every connector so filtering would silently drop relevant pages.
     filter_meta: dict | None = None
-    if connector_filter:
+    if connector_filter and collection == "jira":
         filter_meta = {"component": {"$eq": connector_filter}}
 
     per_query_k = max(k, 12)   # fetch extra candidates so RRF has a rich pool

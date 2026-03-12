@@ -291,46 +291,67 @@ QUERY PHASE (runs every time you ask a question):
  PART 4 — PROJECT FILE STRUCTURE & WHAT EACH FILE DOES
 ════════════════════════════════════════════════════════════════════════════════
 
-  D:\application-docs-rag\
+  D:\arcmind\
   │
-  ├── .env                    ← Secret configuration file
-  │                             OPENAI_API_KEY, model names, paths
-  │                             NEVER commit this to Git
-  │
-  ├── requirements.txt        ← List of Python packages to install
-  │                             pip install -r requirements.txt reads this
+  ├── .env                    ← Secret configuration (never commit to Git)
+  │                             OPENAI_API_KEY, JIRA_*, model names, paths
+  ├── .env.example            ← Template — copy to .env and fill in values
+  ├── requirements.txt        ← pip install -r requirements.txt
   │
   ├── main.py                 ← FastAPI web server
-  │                             Defines all API routes (/api/chat, /api/ingest)
-  │                             Entry point: uvicorn main:app
+  │                             All API routes: /api/chat, /api/ingest,
+  │                             /api/ingest/jira, /api/ingest/progress,
+  │                             /api/status
   │
-  ├── rag_engine.py           ← Core RAG logic
-  │                             Builds the LangChain retrieval chain
-  │                             Connects ChromaDB retriever + OpenAI LLM
-  │                             Manages conversation history
+  ├── connectors/
+  │   └── jira_client.py      ← Jira REST API v3 client
+  │                             Cursor-based pagination (nextPageToken)
+  │                             Fetches: summary, description, comments,
+  │                             status, type, priority, labels, components,
+  │                             fix versions, sprint, created, updated
   │
-  ├── ingest.py               ← Document ingestion pipeline
-  │                             Two modes:
-  │                             1. Web crawl: fetches pages from DOCS_URL
-  │                             2. Local files: reads from DOCS_DIR
-  │                             Both: strips noise → splits → embeds → stores
+  ├── ingest/
+  │   ├── __init__.py         ← Re-exports run_ingestion, run_jira_ingestion
+  │   ├── ingest_docs.py      ← HTML doc ingestion pipeline
+  │   │                         Web crawl (DOCS_URL) or local folder (DOCS_DIR)
+  │   │                         BeautifulSoup strips noise → chunk → embed → store
+  │   ├── ingest_jira.py      ← Jira ingestion pipeline
+  │   │                         fetch issues → format text → chunk → embed → store
+  │   └── chunking.py         ← Token-aware RecursiveCharacterTextSplitter
+  │                             600 tokens / 100 token overlap
+  │
+  ├── rag/
+  │   ├── __init__.py
+  │   ├── engine.py           ← Top-level ask() function, orchestrates pipeline
+  │   ├── retriever.py        ← Hybrid BM25 + vector search with reranker
+  │   │                         Searches both arcmind_docs and arcmind_jira
+  │   │                         Jira filtered by connector/component if detected
+  │   ├── query_expander.py   ← LLM-driven (gpt-4o-mini) query expansion
+  │   │                         Generates 5 query variants for broader recall
+  │   ├── jira_clusterer.py   ← Groups Jira results into readable ticket summaries
+  │   ├── prompt_builder.py   ← Assembles final GPT prompt with doc + jira context
+  │   └── memory.py           ← Conversation history (in-memory, per session)
+  │
+  ├── vector_db/
+  │   ├── __init__.py
+  │   └── chroma_store.py     ← Manages two ChromaDB collections:
+  │                             arcmind_docs  — documentation chunks
+  │                             arcmind_jira  — Jira ticket chunks
+  │                             Plus companion BM25 Okapi pickle per collection
   │
   ├── static/
-  │   └── index.html          ← The entire chat user interface
-  │                             Pure HTML + CSS + JavaScript (no frameworks)
-  │                             Communicates with FastAPI via fetch() calls
+  │   └── index.html          ← Full chat UI (HTML + CSS + JS, no frameworks)
+  │                             Live Jira indexing progress bar
+  │                             Status badge: docs: X, jira: Y vectors
   │
-  ├── chroma_db/              ← Auto-created after first ingestion
-  │                             Local vector database (SQLite file)
-  │                             Contains all 4179 embedded document chunks
-  │                             Delete this folder to re-index from scratch
+  ├── chroma_db/              ← Auto-created after first indexing
+  │                             SQLite + BM25 pickles (bm25_docs.pkl, bm25_jira.pkl)
+  │                             Persisted as Docker volume chroma_data
   │
-  ├── docs/                   ← (Optional) local docs folder
-  │                             Not used — DOCS_URL in .env points to
-  │                             https://cdn.cdata.com/help/AZN/mft/
-  │                             Set DOCS_URL= and DOCS_DIR=./docs to use local
-  │
-  ├── README.md               ← Setup guide and documentation
+  ├── Dockerfile              ← Two-stage build (builder + lean runtime)
+  │                             Pre-downloads reranker model at build time
+  ├── docker-compose.yml      ← Run with: docker compose up --build
+  ├── README.md               ← Setup guide
   └── PROJECT_ARCHITECTURE.txt ← This file
 
 
@@ -417,10 +438,28 @@ QUERY PHASE (runs every time you ask a question):
 │                       │ far more accurate relevance scoring than            │
 │                       │ embedding similarity alone (~22MB, cached locally). │
 ├───────────────────────┼──────────────────────────────────────────────────────┤
+│ rank-bm25             │ BM25 keyword search algorithm (Okapi BM25).         │
+│                       │ Why: Vector search is great for semantic meaning    │
+│                       │ but misses exact keyword matches (e.g. a ticket     │
+│                       │ number like "ARC-1234" or a rare product name).     │
+│                       │ BM25 excels at exact term frequency matching.       │
+│                       │ Combining both (hybrid search) gives best recall.   │
+│                       │ The BM25 index is pickled to chroma_db/ so it       │
+│                       │ persists alongside the ChromaDB vector store.       │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ Jira REST API v3      │ Atlassian hosted API for fetching Jira issues.      │
+│                       │ Why: Support tickets and bug reports often contain  │
+│                       │ the most up-to-date operational knowledge that is   │
+│                       │ NOT in documentation yet. Indexing Jira lets the    │
+│                       │ AI answer "has this bug been reported?" or "how     │
+│                       │ did others configure X?" questions from real data.  │
+│                       │ Uses cursor pagination (nextPageToken) to fetch     │
+│                       │ ALL issues regardless of project size.              │
+├───────────────────────┼──────────────────────────────────────────────────────┤
 │ requests              │ Standard Python HTTP client library.                │
-│                       │ Why: Used by the web crawler in ingest.py to fetch  │
-│                       │ HTML pages from DOCS_URL. Handles timeouts,         │
-│                       │ redirects, and Content-Type checking.               │
+│                       │ Why: Used by the web crawler (ingest_docs.py) and   │
+│                       │ the Jira client (jira_client.py). Handles timeouts, │
+│                       │ redirects, auth, and Content-Type checking.         │
 ├───────────────────────┼──────────────────────────────────────────────────────┤
 │ Docker / Podman       │ Container runtime for packaging and deploying the   │
 │                       │ application. Dockerfile defines the image build.    │
@@ -440,63 +479,74 @@ QUERY PHASE (runs every time you ask a question):
   ║   ┌──────────────────────────────────────────────────────────────────┐   ║
   ║   │                  static/index.html (Chat UI)                     │   ║
   ║   │                                                                  │   ║
-  ║   │   [⚡ Index Docs]   [🗑 Clear Chat]   ✓ Ready — 6240 vectors     │   ║
+  ║   │  [⚡ Index Docs] [🔗 Index Jira]  ✓ Ready — 20,479 vectors      │   ║
+  ║   │                  (docs: 2809, jira: 17670)                       │   ║
   ║   │  ─────────────────────────────────────────────────────────────   │   ║
   ║   │   AI: To configure SFTP, navigate to the connector settings...   │   ║
-  ║   │       📄 Sources: SFTP.html, SFTP-Server.html                   │   ║
+  ║   │       📄 Sources: SFTP.html  •  ARC-1234, ARC-5678              │   ║
   ║   │  ─────────────────────────────────────────────────────────────   │   ║
   ║   │   [Type your question here...                          ] [Send]  │   ║
-  ║   └─────────────────────┬────────────────────┬────────────────────  ┘   ║
-  ╚═════════════════════════│════════════════════│═══════════════════════════╝
-                            │ POST /api/chat      │ POST /api/ingest
-                            │ {question,history}  │ {docs_dir, reset}
-                            ▼                     ▼
+  ║   └──────────┬──────────────────┬──────────────────────────────────  ┘   ║
+  ╚══════════════│══════════════════│═══════════════════════════════════════╝
+                 │ POST /api/chat   │ POST /api/ingest  POST /api/ingest/jira
+                 │ {question,       │ {reset:true}      {reset:true}
+                 │  history}        │
+                 ▼                  ▼
   ╔══════════════════════════════════════════════════════════════════════════╗
   ║                     FASTAPI BACKEND  (main.py)                          ║
   ║                                                                          ║
-  ║   GET  /              →  serves static/index.html                       ║
-  ║   GET  /api/status    →  checks if chroma_db/ exists and has vectors    ║
-  ║   POST /api/ingest    →  calls ingest.py → run_ingestion()              ║
-  ║   POST /api/chat      →  calls rag_engine.py → ask()                    ║
-  ╚══════════════╤═══════════════════════════════════╤═════════════════════╝
-                 │                                   │
-                 ▼                                   ▼
-  ╔═════════════════════════╗         ╔════════════════════════════════════╗
-  ║    ingest.py            ║         ║    rag_engine.py                   ║
-  ║                         ║         ║                                    ║
-  ║  if DOCS_URL set:       ║         ║  1. load_vector_store()            ║
-  ║  1. crawl_site()        ║         ║     ChromaDB.load(chroma_db/)      ║
-  ║     requests.get()      ║         ║                                    ║
-  ║     follow href links   ║         ║  2. Build LangChain chain:         ║
-  ║     stay within prefix  ║         ║     Chain 1: history_aware         ║
-  ║  else (DOCS_DIR):       ║         ║              _retriever            ║
-  ║  1. glob **/*.html      ║         ║     Chain 2: stuff_documents       ║
-  ║  2. BeautifulSoup       ║         ║              _chain (QA)           ║
-  ║     strip noise         ║         ║                                    ║
-  ║  3. RecursiveText       ║         ║  2. Build LangChain chain:         ║
-  ║     Splitter            ║         ║     Chain 1: history_aware         ║
-  ║     1000 chars          ║         ║              _retriever            ║
-  ║     200 overlap         ║         ║     Chain 2: stuff_documents       ║
-  ║  4. OpenAI Embeddings   ║         ║              _chain (QA)           ║
-  ║     → vectors           ║         ║                                    ║
-  ║  5. Chroma.from_docs()  ║         ║  3. chain.invoke(                  ║
-  ║     → save chroma_db/   ║         ║       input=question,              ║
-  ╚══════════╤══════════════╝         ║       chat_history=history)        ║
-             │                        ╚══════╤════════════════╤════════════╝
-             │                               │                │
-             ▼                               ▼                ▼
-  ╔══════════════════╗            ╔═══════════════╗   ╔═════════════════════╗
-  ║   ChromaDB       ║            ║   ChromaDB    ║   ║   OpenAI API        ║
-  ║   (chroma_db/)   ║            ║   MMR Search  ║   ║                     ║
-  ║                  ║            ║               ║   ║  /v1/embeddings     ║
-  ║  SQLite file     ║◄───────────║  question     ║   ║  text-embedding     ║
-  ║  6240 vectors    ║  stores    ║  vector vs    ║   ║  -3-small           ║
-  ║  + text chunks   ║            ║  6240 stored  ║   ║                     ║
-  ║  + source files  ║────────────►  vectors      ║   ║  /v1/chat/          ║
-  ╚══════════════════╝  retrieves ║               ║   ║  completions        ║
-                                  ║  Returns top  ║   ║  gpt-4o-mini        ║
-                                  ║  5 chunks     ║   ║                     ║
-                                  ╚═══════════════╝   ╚═════════════════════╝
+  ║   GET  /                    →  serves static/index.html                 ║
+  ║   GET  /api/status          →  docs_vectors, jira_vectors, total        ║
+  ║   POST /api/ingest          →  ingest_docs_async()                      ║
+  ║   POST /api/ingest/jira     →  ingest_jira_async()                      ║
+  ║   GET  /api/ingest/progress →  live fetched/total counter               ║
+  ║   POST /api/chat            →  rag.engine.ask()                         ║
+  ╚═══════════════╤═════════════════════════╤══════════════╤════════════════╝
+                  │                         │              │
+                  ▼                         ▼              ▼
+  ╔══════════════════════╗  ╔═══════════════════════╗  ╔══════════════════════╗
+  ║ ingest/              ║  ║ connectors/            ║  ║ rag/engine.py        ║
+  ║ ingest_docs.py       ║  ║ jira_client.py         ║  ║                      ║
+  ║                      ║  ║                        ║  ║ 1. query_expander    ║
+  ║ crawl URL or         ║  ║ GET /search/jql        ║  ║    gpt-4o-mini       ║
+  ║ read DOCS_DIR        ║  ║ (Jira REST API v3)     ║  ║    → 5 variants      ║
+  ║ BeautifulSoup        ║  ║ cursor pagination      ║  ║                      ║
+  ║ strip noise          ║  ║ nextPageToken          ║  ║ 2. retriever.py      ║
+  ║ → chunk 600t         ║  ║ → ALL issues           ║  ║    BM25 (keyword)    ║
+  ║ → embed              ║  ║                        ║  ║    + vector search   ║
+  ║ → arcmind_docs       ║  ║ ingest/                ║  ║    merge + dedup     ║
+  ║ → bm25_docs.pkl      ║  ║ ingest_jira.py         ║  ║    cross-encoder     ║
+  ║                      ║  ║ format text            ║  ║    rerank            ║
+  ╚══════════════════════╝  ║ → chunk 600t           ║  ║                      ║
+                            ║ → embed                ║  ║ 3. prompt_builder    ║
+                            ║ → arcmind_jira         ║  ║    doc chunks +      ║
+                            ║ → bm25_jira.pkl        ║  ║    jira cluster      ║
+                            ╚════════════╤═══════════╝  ║    → GPT-4.1 prompt  ║
+                                         │              ║                      ║
+                                         │              ║ 4. gpt-4.1           ║
+                                         │              ║    → answer+sources  ║
+                                         │              ╚══════════╤═══════════╝
+                                         │                         │
+                                         ▼                         ▼
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║  vector_db/chroma_store.py  (ChromaDB  +  BM25 Okapi)                  ║
+  ║                                                                          ║
+  ║  ┌───────────────────────────────┐  ┌────────────────────────────────┐  ║
+  ║  │ collection: arcmind_docs      │  │ collection: arcmind_jira       │  ║
+  ║  │ ~2,800 vectors                │  │ ~17,000 – 40,000 vectors       │  ║
+  ║  │ + bm25_docs.pkl               │  │ + bm25_jira.pkl                │  ║
+  ║  └───────────────────────────────┘  └────────────────────────────────┘  ║
+  ║  Stored at CHROMA_DB_DIR  (./chroma_db  or  /app/chroma_db in Docker)   ║
+  ╚══════════════════════════════════════════════════════════════════════════╝
+                                │                    │
+                                ▼ embed calls        ▼ chat calls
+                   ╔════════════════════════════════════════╗
+                   ║  OpenAI API                            ║
+                   ║  /v1/embeddings  text-embedding-3-large║
+                   ║  /v1/chat/completions  gpt-4.1         ║
+                   ║  /v1/chat/completions  gpt-4o-mini     ║
+                   ║                       (query expansion)║
+                   ╚════════════════════════════════════════╝
 
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -516,7 +566,7 @@ HTTP Request:
 
   Body:
   {
-    "model": "text-embedding-3-small",
+    "model": "text-embedding-3-large",
     "input": "To configure SFTP, navigate to the connector settings..."
   }
 
@@ -529,7 +579,8 @@ HTTP Response:
     "usage": { "prompt_tokens": 42, "total_tokens": 42 }
   }
 
-Cost: ~$0.00002 per 1000 tokens (very cheap — whole 6240 chunk index costs ~$0.05)
+Cost: ~$0.00013 per 1000 tokens (text-embedding-3-large)
+      Indexing ~20,000 chunks costs roughly $0.15–0.20
 
 
 ──────────────────────────────────────────
@@ -545,7 +596,7 @@ HTTP Request:
 
   Body:
   {
-    "model": "gpt-4o-mini",
+    "model": "gpt-4.1",
     "temperature": 0.2,
     "messages": [
       {
@@ -595,8 +646,11 @@ HTTP Response:
     }
   }
 
-Cost: ~$0.00015 per 1000 input tokens + $0.00060 per 1000 output tokens
-      (a typical question costs less than $0.001 = less than 0.1 paise)
+Cost: gpt-4.1 — ~$0.002 per 1000 input tokens + $0.008 per 1000 output tokens
+      A typical question with 2000 tokens context costs ~$0.005 (~0.5 paise)
+
+  Note: gpt-4o-mini is used separately for query expansion (cheap call,
+  ~200 tokens, less than $0.0001 per question).
 
 
 ════════════════════════════════════════════════════════════════════════════════

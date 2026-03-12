@@ -153,9 +153,10 @@ class ChromaStore:
         pkl_path = _BM25_DOCS_PKL if collection_name == DOCS_COLLECTION else _BM25_JIRA_PKL
 
         try:
-            raw = store._collection.get(include=["documents", "ids"])
-            texts: list[str] = raw.get("documents") or []
-            ids:   list[str] = raw.get("ids")       or []
+            raw = store._collection.get(include=["documents", "metadatas"])
+            texts:     list[str]  = raw.get("documents") or []
+            ids:       list[str]  = raw.get("ids")       or []
+            metadatas: list[dict] = raw.get("metadatas") or [{}] * len(texts)
 
             if not texts:
                 log.warning("No texts for BM25 index in '%s'.", collection_name)
@@ -163,7 +164,8 @@ class ChromaStore:
 
             tokenized = [t.lower().split() for t in texts]
             bm25      = BM25Okapi(tokenized)
-            corpus    = list(zip(ids, texts))
+            # Store (id, text, metadata) so ticket IDs survive BM25 retrieval
+            corpus    = list(zip(ids, texts, metadatas))
 
             os.makedirs(CHROMA_DB_DIR, exist_ok=True)
             with open(pkl_path, "wb") as fh:
@@ -312,11 +314,12 @@ class ChromaStore:
             score = float(scores[idx])
             if score <= 0.0:
                 continue
-            _, text = corpus[idx]
-            docs.append(Document(
-                page_content=text,
-                metadata={"bm25_score": score},
-            ))
+            entry = corpus[idx]
+            # Support both old 2-tuple corpus and new 3-tuple corpus
+            text     = entry[1]
+            metadata = dict(entry[2]) if len(entry) > 2 else {}
+            metadata["bm25_score"] = score
+            docs.append(Document(page_content=text, metadata=metadata))
         return docs
 
     def get_jira_by_tickets(self, ticket_ids: list[str]) -> list[Document]:

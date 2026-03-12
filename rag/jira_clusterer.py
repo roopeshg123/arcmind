@@ -121,16 +121,19 @@ def format_jira_clusters(clusters: dict[str, list[Document]]) -> str:
         for doc in docs:
             ticket  = doc.metadata.get("ticket", "Unknown")
             status  = doc.metadata.get("status", "")
-            # Extract the first non-header, non-empty line as a short summary
-            summary = ""
-            skip_keys = {"Ticket:", "Type:", "Status:", "Priority:", "Resolution:"}
-            for line in doc.page_content.splitlines():
-                stripped = line.strip()
-                if stripped and not any(stripped.startswith(k) for k in skip_keys):
-                    summary = stripped[:120]
-                    break
+            # Use stored summary metadata first; fall back to content parsing
+            summary = doc.metadata.get("summary", "")
+            if not summary:
+                skip_keys = {"Ticket:", "Type:", "Status:", "Priority:",
+                             "Resolution:", "Components:", "Labels:", "Summary:",
+                             "Description:", "Comments:"}
+                for line in doc.page_content.splitlines():
+                    stripped = line.strip()
+                    if stripped and not any(stripped.startswith(k) for k in skip_keys):
+                        summary = stripped[:120]
+                        break
             status_tag = f" [{status}]" if status else ""
-            lines.append(f"- **{ticket}**{status_tag}: {summary}")
+            lines.append(f"- **{ticket}**{status_tag}: {summary[:120]}")
         lines.append("")   # blank line between clusters
 
     return "\n".join(lines).strip()

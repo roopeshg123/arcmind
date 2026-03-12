@@ -202,8 +202,8 @@ def _run_pipeline(
     # 2. Route
     route = route_query(question)
 
-    # 3. Expand
-    expanded = expand_query(question, connector=connector)
+    # 3. Expand — always use LLM expansion for better recall on short/ambiguous queries
+    expanded = expand_query(question, connector=connector, use_llm=True)
     log.info("Query expansion: %d variant(s).", len(expanded))
 
     # 4. Retrieve

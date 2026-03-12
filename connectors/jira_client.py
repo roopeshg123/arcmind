@@ -87,19 +87,33 @@ def _format_issue(issue: dict) -> dict:
     resolution_field = fields.get("resolution")
     resolution = resolution_field.get("name", "") if isinstance(resolution_field, dict) else ""
 
+    fix_versions = [
+        v.get("name", "") for v in (fields.get("fixVersions") or [])
+    ]
+
+    # Sprint name (customfield_10014 is the standard Jira sprint field)
+    sprint_raw = fields.get("customfield_10014")
+    sprint = ""
+    if isinstance(sprint_raw, list) and sprint_raw:
+        sprint = sprint_raw[-1].get("name", "") if isinstance(sprint_raw[-1], dict) else ""
+    elif isinstance(sprint_raw, str):
+        sprint = sprint_raw
+
     return {
-        "key":        issue.get("key", ""),
-        "summary":    fields.get("summary", ""),
-        "description": description,
-        "comments":   "\n".join(comment_list),
-        "labels":     labels,
-        "components": components,
-        "status":     (fields.get("status") or {}).get("name", ""),
-        "issue_type": (fields.get("issuetype") or {}).get("name", ""),
-        "priority":   (fields.get("priority") or {}).get("name", ""),
-        "resolution": resolution,
-        "created":    fields.get("created", ""),
-        "updated":    fields.get("updated", ""),
+        "key":          issue.get("key", ""),
+        "summary":      fields.get("summary", ""),
+        "description":  description,
+        "comments":     "\n".join(comment_list),
+        "labels":       labels,
+        "components":   components,
+        "status":       (fields.get("status") or {}).get("name", ""),
+        "issue_type":   (fields.get("issuetype") or {}).get("name", ""),
+        "priority":     (fields.get("priority") or {}).get("name", ""),
+        "resolution":   resolution,
+        "fix_versions": fix_versions,
+        "sprint":       sprint,
+        "created":      fields.get("created", ""),
+        "updated":      fields.get("updated", ""),
     }
 
 
@@ -111,6 +125,7 @@ _DEFAULT_FIELDS = [
     "key", "summary", "description", "comment",
     "labels", "components", "status", "issuetype",
     "priority", "created", "updated", "resolution",
+    "fixVersions", "customfield_10014",  # fix versions + sprint
 ]
 
 
@@ -118,14 +133,16 @@ async def fetch_issues(
     jql: str | None = None,
     max_results: int = 0,
     fields: list[str] | None = None,
+    on_progress: Any = None,
 ) -> list[dict]:
     """
     Fetch Jira issues asynchronously with full pagination.
 
     Args:
-        jql:        JQL query string. Defaults to all issues in JIRA_PROJECT_KEY.
+        jql:         JQL query string. Defaults to all issues in JIRA_PROJECT_KEY.
         max_results: Maximum issues to fetch. 0 = no limit (fetch all).
-        fields:     Fields to request. Defaults to _DEFAULT_FIELDS.
+        fields:      Fields to request. Defaults to _DEFAULT_FIELDS.
+        on_progress: Optional callable(fetched: int) called after each page.
 
     Returns:
         List of normalized issue dicts.
@@ -143,7 +160,7 @@ async def fetch_issues(
         fields = _DEFAULT_FIELDS
 
     issues: list[dict] = []
-    start_at = 0
+    next_page_token: str | None = None
 
     async with httpx.AsyncClient(
         base_url=JIRA_URL.rstrip("/"),
@@ -154,13 +171,14 @@ async def fetch_issues(
         while True:
             params: dict[str, Any] = {
                 "jql":        jql,
-                "startAt":    start_at,
                 "maxResults": JIRA_PAGE_SIZE,
                 "fields":     ",".join(fields),
             }
+            if next_page_token:
+                params["nextPageToken"] = next_page_token
 
             try:
-                resp = await client.get("/rest/api/3/search", params=params)
+                resp = await client.get("/rest/api/3/search/jql", params=params)
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 log.error(
@@ -175,20 +193,20 @@ async def fetch_issues(
 
             data = resp.json()
             batch: list[dict] = data.get("issues", [])
-            total: int = data.get("total", 0)
 
             for raw in batch:
                 issues.append(_format_issue(raw))
 
-            fetched = start_at + len(batch)
-            log.info("Jira: %d / %d issues fetched.", fetched, total)
+            log.info("Jira: %d issues fetched so far.", len(issues))
+            if on_progress:
+                on_progress(len(issues))
 
-            if not batch or fetched >= total:
+            # New API uses cursor-based pagination via nextPageToken
+            next_page_token = data.get("nextPageToken")
+            if not batch or not next_page_token:
                 break
-            if max_results and fetched >= max_results:
+            if max_results and len(issues) >= max_results:
                 break
-
-            start_at += len(batch)
 
     log.info("Jira fetch complete: %d issues.", len(issues))
     return issues

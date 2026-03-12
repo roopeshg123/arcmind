@@ -355,7 +355,7 @@
       const data = await res.json();
       if (data.status === "ready") {
         badge.className = "ready";
-        badge.textContent = `✓ Ready — ${data.vectors.toLocaleString()} vectors`;
+        badge.textContent = `✓ Ready — ${data.total_vectors.toLocaleString()} vectors (docs: ${data.docs_vectors}, jira: ${data.jira_vectors})`;
       } else {
         badge.className = "not_ready";
         badge.textContent = "✗ Not indexed";
@@ -370,8 +370,11 @@
   async function triggerIngest() {
     const btn    = document.getElementById("ingest-btn");
     const status = document.getElementById("ingest-status");
+    const badge  = document.getElementById("status-badge");
     btn.disabled = true;
     status.textContent = "Indexing documentation…";
+    badge.className = "not_ready";
+    badge.textContent = "↻ Re-indexing Docs…";
     try {
       const res  = await fetch("/api/ingest", {
         method: "POST",
@@ -396,23 +399,43 @@
   async function triggerJiraIngest() {
     const btn    = document.getElementById("jira-btn");
     const status = document.getElementById("ingest-status");
+    const badge  = document.getElementById("status-badge");
     btn.disabled = true;
-    status.textContent = "Indexing Jira issues…";
+    status.textContent = "Fetching Jira issues… 0 fetched";
+    // Reflect the reset immediately — Jira collection is wiped on the server
+    // as soon as the request is processed, so show 0 jira vectors right away.
+    badge.className = "not_ready";
+    badge.textContent = "↻ Re-indexing Jira…";
+
+    // Poll /api/ingest/progress every second for live counts
+    let pollTimer = setInterval(async () => {
+      try {
+        const p = await (await fetch("/api/ingest/progress")).json();
+        if (p.stage === "fetching") {
+          status.textContent = `Fetching Jira issues… ${p.fetched.toLocaleString()} fetched`;
+        } else if (p.stage === "embedding") {
+          status.textContent = `Embedding ${p.fetched.toLocaleString()} issues… (this may take a while)`;
+        }
+      } catch (_) {}
+    }, 1000);
+
     try {
       const res  = await fetch("/api/ingest/jira", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reset: true }),
       });
+      clearInterval(pollTimer);
       const data = await res.json();
       if (res.ok) {
         status.textContent =
-          `✓ Jira: ${data.issues_fetched} issue(s) → ${data.vectors_stored} vectors`;
+          `✓ Jira: ${data.issues_fetched.toLocaleString()} issue(s) → ${data.vectors_stored.toLocaleString()} vectors`;
         checkStatus();
       } else {
         status.textContent = `✗ Jira error: ${data.detail}`;
       }
     } catch (e) {
+      clearInterval(pollTimer);
       status.textContent = "✗ Network error (check JIRA_* vars in .env)";
     } finally {
       btn.disabled = false;

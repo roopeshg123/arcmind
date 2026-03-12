@@ -26,7 +26,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import rag_engine
-from ingest import run_ingestion, run_jira_ingestion, run_incremental_jira_sync
+from ingest import run_ingestion
+from ingest.ingest_jira import ingest_jira_async, incremental_jira_sync_async
 
 DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 
@@ -136,6 +137,13 @@ async def status():
 # ---------------------------------------------------------------------------
 
 _ingestion_lock = False   # simple flag to prevent concurrent runs
+_ingest_progress: dict = {"stage": "idle", "fetched": 0, "total": 0, "vectors": 0}
+
+
+@app.get("/api/ingest/progress")
+async def ingest_progress():
+    """Return current ingestion progress (polled by the UI)."""
+    return _ingest_progress
 
 
 @app.post("/api/ingest")
@@ -172,18 +180,25 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
 @app.post("/api/ingest/jira")
 async def ingest_jira(request: JiraIngestRequest):
     """Ingest Jira issues (full or filtered by JQL)."""
-    global _ingestion_lock
+    global _ingestion_lock, _ingest_progress
     if _ingestion_lock:
         raise HTTPException(status_code=409, detail="Ingestion already in progress.")
 
     _ingestion_lock = True
+    _ingest_progress = {"stage": "fetching", "fetched": 0, "total": 0, "vectors": 0}
+    result = None
     try:
-        result = run_jira_ingestion(
+        result = await ingest_jira_async(
             jql=request.jql,
             reset=request.reset,
+            progress=_ingest_progress,
         )
     finally:
         _ingestion_lock = False
+        _ingest_progress = {
+            "stage": "idle", "fetched": 0, "total": 0,
+            "vectors": result.get("vectors_stored", 0) if result else 0,
+        }
 
     return result
 
@@ -191,7 +206,7 @@ async def ingest_jira(request: JiraIngestRequest):
 @app.post("/api/ingest/jira/sync")
 async def jira_sync(request: JiraSyncRequest):
     """Incremental Jira sync — fetches issues updated in the last N hours."""
-    result = run_incremental_jira_sync(hours=request.hours or 1)
+    result = await incremental_jira_sync_async(hours=request.hours or 1)
     return result
 
 

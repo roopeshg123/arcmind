@@ -63,63 +63,60 @@ def _detect_connector(text: str, components: list[str]) -> str:
 def _format_ticket_text(issue: dict) -> str:
     """
     Render a Jira issue dict as human-readable structured text.
-
-    Format:
-        Ticket: ARCESB-XXXXX
-        Type: Bug
-        Status: Resolved
-        ...
-
-        Summary:
-        <summary>
-
-        Description:
-        <description>
-
-        Comments:
-        <comments>
+    All fields coerced to str so page_content is never None.
     """
+    def _s(v) -> str:
+        return str(v).strip() if v is not None else ""
+
     lines: list[str] = [
-        f"Ticket: {issue['key']}",
-        f"Type: {issue['issue_type']}",
-        f"Status: {issue['status']}",
-        f"Priority: {issue['priority']}",
+        f"Ticket: {_s(issue.get('key'))}",
+        f"Summary: {_s(issue.get('summary'))}",
+        f"Type: {_s(issue.get('issue_type'))}",
+        f"Status: {_s(issue.get('status'))}",
+        f"Priority: {_s(issue.get('priority'))}",
     ]
 
     if issue.get("resolution"):
-        lines.append(f"Resolution: {issue['resolution']}")
+        lines.append(f"Resolution: {_s(issue['resolution'])}")
     if issue.get("components"):
-        lines.append(f"Components: {', '.join(issue['components'])}")
+        lines.append(f"Components: {', '.join(_s(c) for c in issue['components'])}")
     if issue.get("labels"):
-        lines.append(f"Labels: {', '.join(issue['labels'])}")
-
-    lines.extend(["", "Summary:", issue["summary"]])
+        lines.append(f"Labels: {', '.join(_s(l) for l in issue['labels'])}")
+    if issue.get("fix_versions"):
+        lines.append(f"Fix Versions: {', '.join(_s(v) for v in issue['fix_versions'])}")
+    if issue.get("sprint"):
+        lines.append(f"Sprint: {_s(issue['sprint'])}")
+    if issue.get("created"):
+        lines.append(f"Created: {_s(issue['created'])[:10]}")
+    if issue.get("updated"):
+        lines.append(f"Updated: {_s(issue['updated'])[:10]}")
 
     if issue.get("description"):
-        lines.extend(["", "Description:", issue["description"][:2000]])
+        lines.extend(["", "Description:", _s(issue["description"])[:3000]])
 
     if issue.get("comments"):
-        lines.extend(["", "Comments:", issue["comments"][:3000]])
+        lines.extend(["", "Comments:", _s(issue["comments"])[:5000]])
 
     return "\n".join(lines)
-
-
 def issues_to_documents(issues: list[dict]) -> list[Document]:
     """Convert a list of Jira issue dicts to LangChain Documents."""
     docs: list[Document] = []
     for issue in issues:
-        text = _format_ticket_text(issue)
+        text = _format_ticket_text(issue) or ""
+        if not text.strip():
+            continue  # skip tickets that produced empty content
         connector = _detect_connector(
-            text=f"{issue['summary']} {issue.get('description', '')}",
+            text=f"{issue.get('summary', '')} {issue.get('description', '')}",
             components=issue.get("components", []),
         )
         docs.append(Document(
             page_content=text,
             metadata={
                 "source":    "jira",
-                "ticket":    issue["key"],
-                "type":      issue["issue_type"].lower(),
-                "status":    issue["status"].lower(),
+                "ticket":    issue.get("key", ""),
+                "summary":   issue.get("summary") or "",
+                "type":      (issue.get("issue_type") or "").lower(),
+                "status":    (issue.get("status") or "").lower(),
                 "component": connector,
                 "created":   issue.get("created", ""),
                 "updated":   issue.get("updated", ""),
@@ -136,6 +133,7 @@ async def ingest_jira_async(
     jql: str | None = None,
     reset: bool = False,
     max_results: int = 0,
+    progress: dict | None = None,
 ) -> dict:
     """
     Async Jira ingestion: fetch → format → chunk → embed → store.
@@ -144,6 +142,7 @@ async def ingest_jira_async(
         jql:         JQL filter.  Defaults to all issues in JIRA_PROJECT_KEY.
         reset:       Drop the existing Jira collection before ingesting.
         max_results: Cap on how many issues to fetch (0 = no limit).
+        progress:    Optional dict updated in-place with live progress info.
 
     Returns:
         Status dict with counts.
@@ -151,8 +150,15 @@ async def ingest_jira_async(
     if jql is None:
         jql = f"project = {JIRA_PROJECT_KEY} ORDER BY updated DESC"
 
+    if progress is not None:
+        progress.update({"stage": "fetching", "fetched": 0, "total": 0, "vectors": 0})
+
+    def _on_page(fetched: int) -> None:
+        if progress is not None:
+            progress["fetched"] = fetched
+
     log.info("Jira ingestion started.  JQL: %s", jql)
-    issues = await fetch_issues(jql=jql, max_results=max_results)
+    issues = await fetch_issues(jql=jql, max_results=max_results, on_progress=_on_page)
 
     if not issues:
         log.warning("No Jira issues fetched — check credentials and JQL.")
@@ -164,13 +170,17 @@ async def ingest_jira_async(
             "vectors_stored": 0,
         }
 
+    if progress is not None:
+        progress.update({"stage": "embedding", "fetched": len(issues), "total": len(issues)})
+
     documents = issues_to_documents(issues)
-    # Tickets are naturally self-contained; use slightly larger chunks to keep
-    # summary + description together.
     chunks = chunk_documents(documents, chunk_size=600, chunk_overlap=100)
 
     store = get_store()
     count = store.add_jira_batch(chunks, reset=reset)
+
+    if progress is not None:
+        progress.update({"stage": "done", "vectors": count})
 
     log.info(
         "Jira ingestion complete: %d issues → %d chunks → %d vectors.",
@@ -190,15 +200,14 @@ def ingest_jira(
     reset: bool = False,
     max_results: int = 0,
 ) -> dict:
-    """Synchronous wrapper for ingest_jira_async."""
+    """Synchronous wrapper for ingest_jira_async (CLI use only)."""
     return asyncio.run(ingest_jira_async(jql=jql, reset=reset, max_results=max_results))
 
 
-def incremental_jira_sync(hours: int = 1) -> dict:
+async def incremental_jira_sync_async(hours: int = 1) -> dict:
     """
-    Sync Jira issues that were updated in the last *hours* hours.
-
-    Uses append mode (reset=False) so existing vectors are not deleted.
+    Async incremental Jira sync — fetches issues updated in the last *hours* hours.
+    Used by FastAPI endpoints (running event loop).
     """
     jql = (
         f"project = {JIRA_PROJECT_KEY} "
@@ -206,4 +215,12 @@ def incremental_jira_sync(hours: int = 1) -> dict:
         "ORDER BY updated DESC"
     )
     log.info("Incremental Jira sync — last %dh.  JQL: %s", hours, jql)
-    return ingest_jira(jql=jql, reset=False)
+    return await ingest_jira_async(jql=jql, reset=False)
+
+
+def incremental_jira_sync(hours: int = 1) -> dict:
+    """
+    Sync Jira issues that were updated in the last *hours* hours.
+    Synchronous wrapper for CLI use only.
+    """
+    return asyncio.run(incremental_jira_sync_async(hours=hours))

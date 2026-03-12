@@ -1,16 +1,13 @@
 """
 Query expander for ArcMind.
 
-Generates multiple semantically related search queries from a single user
-question to improve retrieval recall.
+Generates semantically related search queries from a single user question
+to improve retrieval recall across all topics — not just known connectors.
 
-Two expansion strategies
-------------------------
-1. Static  — connector-specific expansion table (fast, deterministic)
-2. LLM     — optional GPT-based expansion for general queries (adds ~1 s)
-
-The default pipeline uses static-only expansion.  Set use_llm=True to
-additionally invoke the LLM.
+Strategy: LLM-first expansion using gpt-4o-mini.
+The LLM expands acronyms, generates aspect-specific variants (config, errors,
+usage, troubleshooting) and handles any topic in the CData Arc domain.
+Falls back gracefully to the original query if the LLM call fails.
 """
 
 from __future__ import annotations
@@ -27,134 +24,30 @@ log = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 FAST_MODEL     = "gpt-4o-mini"   # fast/cheap model for expansion
 
-# ---------------------------------------------------------------------------
-# Static expansion tables — one entry per Arc connector
-# ---------------------------------------------------------------------------
+_SYSTEM_PROMPT = (
+    "You are a search-query expert for the CData Arc enterprise integration "
+    "platform (also called ArcESB). Your job is to expand a user question into "
+    "5 distinct search queries that together maximise recall against the "
+    "Arc documentation and Jira issue tracker.\n\n"
+    "Rules:\n"
+    "1. Always expand acronyms on first use "
+    "   (MDN → Message Disposition Notification, "
+    "   AS2, SFTP, OFTP, X12, EDIFACT, FTP, SMTP, REST, HTTP keep their names "
+    "   but add the words 'connector' and 'Arc').\n"
+    "2. Cover different aspects across the 5 queries:\n"
+    "   – one query about configuration / setup\n"
+    "   – one about common errors / troubleshooting\n"
+    "   – one about a specific sub-feature or concept mentioned\n"
+    "   – one broad topic query\n"
+    "   – one with alternative phrasing / synonyms\n"
+    "3. Use CData Arc / ArcESB terminology where possible.\n"
+    "4. Return ONLY the 5 queries, one per line, no numbering, no extra text."
+)
 
-_CONNECTOR_EXPANSIONS: dict[str, list[str]] = {
-    "AS2": [
-        "AS2 connector configuration setup Arc",
-        "AS2 MDN acknowledgement receipt",
-        "AS2 certificate encryption digital signing",
-        "AS2 EDI protocol trading partner",
-        "AS2 send receive message",
-    ],
-    "SFTP": [
-        "SFTP connector configuration",
-        "SFTP file transfer authentication key",
-        "SFTP host port connection",
-        "SFTP upload download directory",
-    ],
-    "OFTP": [
-        "OFTP Odette connector configuration",
-        "OFTP2 file transfer certificate",
-        "Odette FTP trading partner",
-    ],
-    "X12": [
-        "X12 EDI connector Arc",
-        "X12 transaction set 850 856 810",
-        "X12 interchange envelope segment",
-        "X12 mapping transformation",
-    ],
-    "EDIFACT": [
-        "EDIFACT connector configuration Arc",
-        "EDIFACT ORDERS INVOIC DESADV messages",
-        "EDIFACT trading partner mapping",
-        "EDIFACT envelope structure UNB UNG UNH",
-    ],
-    "Peppol": [
-        "Peppol BIS connector Arc",
-        "Peppol access point configuration",
-        "Peppol e-invoicing UBL",
-        "Peppol SMP SML lookup participant",
-    ],
-    "HTTP": [
-        "HTTP connector request response Arc",
-        "HTTP authentication headers settings",
-        "HTTP REST integration endpoint",
-    ],
-    "FTP": [
-        "FTP connector configuration Arc",
-        "FTP file transfer active passive mode",
-        "FTP authentication TLS",
-    ],
-    "SMTP": [
-        "SMTP email connector Arc",
-        "SMTP mail server TLS authentication",
-        "SMTP send receive email configuration",
-    ],
-    "REST": [
-        "REST API connector Arc",
-        "REST OAuth2 authentication",
-        "REST HTTP methods GET POST PUT",
-    ],
-    "ArcScript": [
-        "ArcScript scripting language Arc",
-        "ArcScript arc:set arc:call functions",
-        "ArcScript conditional logic loop",
-        "ArcScript variable operation",
-    ],
-    "FlatFile": [
-        "flat file CSV connector Arc",
-        "delimited file format parsing",
-        "flat file schema mapping",
-    ],
-    "XML": [
-        "XML connector Arc",
-        "XML mapper XSLT transformation",
-        "XML schema validation",
-    ],
-    "JSON": [
-        "JSON connector Arc",
-        "JSON mapper transformation",
-        "JSON schema validation",
-    ],
-    "Database": [
-        "database connector Arc JDBC",
-        "database query insert update",
-        "database connection pool",
-    ],
-    "Flows": [
-        "Arc flow configuration",
-        "Arc workflow automation",
-        "Arc flow connector routing",
-    ],
-    "Profiles": [
-        "Arc profile configuration",
-        "trading partner profile",
-        "Arc profile settings",
-    ],
-}
-
-
-# ---------------------------------------------------------------------------
-# Static expansion
-# ---------------------------------------------------------------------------
-
-def expand_with_connector(query: str, connector: str | None) -> list[str]:
-    """
-    Return expanded queries using the static connector table.
-
-    Always includes the original *query* as the first element.
-    """
-    queries = [query]
-    if connector and connector in _CONNECTOR_EXPANSIONS:
-        for exp in _CONNECTOR_EXPANSIONS[connector]:
-            # Build a combined query for richer embedding
-            queries.append(f"{query} {exp}")
-        # Also add the raw connector phrases for exact-term coverage
-        queries.extend(_CONNECTOR_EXPANSIONS[connector][:3])
-    return queries
-
-
-# ---------------------------------------------------------------------------
-# LLM expansion (optional)
-# ---------------------------------------------------------------------------
 
 def expand_with_llm(query: str) -> list[str]:
     """
-    Ask the LLM to generate 4 related search queries.
-
+    Ask gpt-4o-mini to generate 5 related search queries.
     Falls back to [query] on any error so the pipeline is never blocked.
     """
     try:
@@ -167,54 +60,36 @@ def expand_with_llm(query: str) -> list[str]:
             temperature=0,
         )
         prompt = ChatPromptTemplate.from_messages([
-            ("system", (
-                "You are a search-query expert for the CData Arc enterprise "
-                "integration platform documentation. Given the user's question, "
-                "generate exactly 4 related search queries that target different "
-                "aspects of the topic (configuration, usage, errors, API). "
-                "Return ONLY the queries, one per line, no numbering."
-            )),
+            ("system", _SYSTEM_PROMPT),
             ("human", "Question: {query}"),
         ])
-        result = (prompt | llm).invoke({"query": query})
+        result   = (prompt | llm).invoke({"query": query})
         expanded = [q.strip() for q in result.content.strip().splitlines() if q.strip()]
-        return [query] + expanded[:4]
+        log.debug("LLM expanded '%s' → %d queries.", query, len(expanded))
+        return [query] + expanded[:5]
 
     except Exception as exc:
-        log.warning("LLM query expansion failed: %s", exc)
+        log.warning("LLM query expansion failed (%s) — using original query only.", exc)
         return [query]
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def expand_query(
-    query: str,
-    connector: str | None = None,
-    use_llm: bool = False,
+    query:     str,
+    connector: str | None = None,  # kept for API compatibility, not used
+    use_llm:   bool = True,
 ) -> list[str]:
     """
-    Build the final expanded query list for retrieval.
+    Build the expanded query list for retrieval.
 
     Args:
         query:     Original user question.
-        connector: Detected Arc connector (from connector_detector).
-        use_llm:   If True AND no static connector expansion was found,
-                   also run LLM-based expansion.
+        connector: Unused — kept for backward compatibility.
+        use_llm:   Run LLM expansion (default True).
 
     Returns:
-        Deduplicated list of query strings (original query first).
+        Deduplicated list of query strings, original query first.
     """
-    queries = expand_with_connector(query, connector)
+    if use_llm:
+        return expand_with_llm(query)
+    return [query]
 
-    # Use LLM only when static expansion didn't add much
-    if use_llm and len(queries) < 4:
-        llm_queries = expand_with_llm(query)
-        seen = set(queries)
-        for q in llm_queries:
-            if q not in seen:
-                queries.append(q)
-                seen.add(q)
-
-    return queries
