@@ -4,8 +4,9 @@ chroma_db/
 # Local docs folder (can be large — teammates bring their own copy)
 docs/
 
-# Secrets — NEVER commit the real .env
-.env
+# .env is committed with placeholder values only — safe for teammates to clone.
+# If you add real keys locally, git will NOT track changes (file is committed as-is).
+# To override locally without committing: git update-index --assume-unchanged .env
 
 # Python
 __pycache__/
