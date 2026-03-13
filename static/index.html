@@ -301,8 +301,10 @@
 
 <!-- =========================================================== TOOLBAR -->
 <div id="toolbar">
-  <button id="ingest-btn" class="primary" onclick="triggerIngest()">⚡ Index Docs</button>
-  <button id="jira-btn" class="primary" onclick="triggerJiraIngest()">🔗 Index Jira</button>
+  <button id="ingest-btn" class="primary" onclick="triggerIngest()" title="Full re-index: drop all doc vectors and rebuild from scratch">⚡ Index Docs</button>
+  <button id="update-docs-btn" onclick="triggerDocsUpdate()" title="Incremental update: only re-embed new or changed files">🔄 Update Docs</button>
+  <button id="jira-btn" class="primary" onclick="triggerJiraIngest()" title="Full re-index: drop all Jira vectors and rebuild from scratch">🔗 Index Jira</button>
+  <button id="update-jira-btn" onclick="triggerJiraUpdate()" title="Incremental update: only re-embed new or changed tickets">🔄 Update Jira</button>
   <button onclick="clearChat()">🗑 Clear Chat</button>
   <span id="ingest-status"></span>
 </div>
@@ -512,6 +514,132 @@
       if (res.ok) {
         status.textContent =
           `✓ Jira: ${data.issues_fetched.toLocaleString()} ticket(s) → ${data.vectors_stored.toLocaleString()} vectors`;
+        showProgress(100, "Complete!");
+        setTimeout(hideProgress, 3000);
+        checkStatus();
+      } else {
+        status.textContent = `✗ Jira error: ${data.detail}`;
+        hideProgress();
+      }
+    } catch (e) {
+      clearInterval(pollTimer);
+      status.textContent = "✗ Network error (check JIRA_* vars in .env)";
+      hideProgress();
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function triggerDocsUpdate() {
+    const btn    = document.getElementById("update-docs-btn");
+    const status = document.getElementById("ingest-status");
+    const badge  = document.getElementById("status-badge");
+    btn.disabled = true;
+    status.textContent = "⏳ Comparing docs…";
+    badge.className = "not_ready";
+    badge.textContent = "↻ Updating Docs…";
+    showProgress(0, "Scanning for changes…");
+
+    let pollTimer = setInterval(async () => {
+      try {
+        const p = await (await fetch("/api/ingest/progress")).json();
+        if (p.stage === "loading") {
+          status.textContent = "⏳ Scanning documentation files…";
+          showProgress(0, "Loading…");
+        } else if (p.stage === "embedding") {
+          const done  = p.chunks_done  || 0;
+          const total = p.chunks_total || 0;
+          if (total > 0) {
+            const pct = Math.round((done / total) * 100);
+            status.textContent = `⚙️ Embedding changes… ${done.toLocaleString()} / ${total.toLocaleString()}`;
+            showProgress(pct, `${pct}% complete`);
+          } else {
+            status.textContent = "⚙️ Embedding changed files…";
+            showProgress(0, "Processing…");
+          }
+        }
+      } catch (_) {}
+    }, 1000);
+
+    try {
+      const res  = await fetch("/api/ingest/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      clearInterval(pollTimer);
+      const data = await res.json();
+      if (res.ok) {
+        if (data.message && data.message.includes("up to date")) {
+          status.textContent = "✓ Docs already up to date — nothing changed.";
+        } else {
+          status.textContent =
+            `✓ Docs: +${data.new_files} new, ~${data.updated_files} updated, -${data.removed_files} removed → ${data.vectors_stored.toLocaleString()} vectors`;
+        }
+        showProgress(100, "Complete!");
+        setTimeout(hideProgress, 3000);
+        checkStatus();
+      } else {
+        status.textContent = `✗ ${data.detail}`;
+        hideProgress();
+      }
+    } catch (e) {
+      status.textContent = "✗ Network error";
+      hideProgress();
+    } finally {
+      clearInterval(pollTimer);
+      btn.disabled = false;
+    }
+  }
+
+  async function triggerJiraUpdate() {
+    const btn    = document.getElementById("update-jira-btn");
+    const status = document.getElementById("ingest-status");
+    const badge  = document.getElementById("status-badge");
+    btn.disabled = true;
+    status.textContent = "⏳ Fetching Jira issues for comparison…";
+    badge.className = "not_ready";
+    badge.textContent = "↻ Updating Jira…";
+    showProgress(0, "Fetching tickets…");
+
+    let pollTimer = setInterval(async () => {
+      try {
+        const p = await (await fetch("/api/ingest/progress")).json();
+        if (p.stage === "fetching") {
+          status.textContent = `⏳ Fetching Jira tickets… ${p.fetched.toLocaleString()} fetched`;
+          showProgress(0, `${p.fetched.toLocaleString()} tickets fetched`);
+        } else if (p.stage === "comparing") {
+          status.textContent = `🔍 Comparing ${p.total.toLocaleString()} tickets against index…`;
+          showProgress(0, "Comparing…");
+        } else if (p.stage === "embedding") {
+          const done  = p.chunks_done  || 0;
+          const total = p.chunks_total || 0;
+          if (total > 0) {
+            const pct = Math.round((done / total) * 100);
+            status.textContent = `⚙️ Embedding changes… ${done.toLocaleString()} / ${total.toLocaleString()} chunks`;
+            showProgress(pct, `${pct}% — ${done.toLocaleString()} of ${total.toLocaleString()} chunks embedded`);
+          } else {
+            status.textContent = `⚙️ Preparing changed tickets…`;
+            showProgress(0, "Chunking…");
+          }
+        }
+      } catch (_) {}
+    }, 1000);
+
+    try {
+      const res  = await fetch("/api/ingest/jira/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      clearInterval(pollTimer);
+      const data = await res.json();
+      if (res.ok) {
+        if (data.message && data.message.includes("up to date")) {
+          status.textContent = `✓ Jira already up to date — ${data.unchanged_tickets.toLocaleString()} ticket(s) unchanged.`;
+        } else {
+          status.textContent =
+            `✓ Jira: +${data.new_tickets} new, ~${data.updated_tickets} updated, -${data.removed_tickets} removed, =${data.unchanged_tickets} unchanged → ${data.vectors_stored.toLocaleString()} vectors`;
+        }
         showProgress(100, "Complete!");
         setTimeout(hideProgress, 3000);
         checkStatus();

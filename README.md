@@ -10,21 +10,22 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 | Path | Purpose |
 |---|---|
 | `main.py` | FastAPI web server — all API routes, API-key auth middleware, CORS |
-| `rag_engine.py` | Top-level RAG pipeline — orchestrates retrieval, reranking, and answer generation |
+| `rag_engine.py` | Top-level RAG pipeline — orchestrates retrieval, reranking, streaming, query logging, and session memory |
 | `connectors/jira_client.py` | Jira REST API v3 client with cursor pagination |
-| `ingest/ingest_docs.py` | HTML doc ingestion — web crawl or local folder, with `MAX_CRAWL_PAGES` cap |
-| `ingest/ingest_jira.py` | Jira issue ingestion pipeline (full + incremental sync) |
-| `ingest/chunking.py` | Token-aware text splitter (1500 tokens / 300 overlap) |
+| `ingest/ingest_docs.py` | HTML doc ingestion — web crawl or local folder, with `MAX_CRAWL_PAGES` cap; `smart_docs_update()` for SHA-256 diff-based incremental update |
+| `ingest/ingest_jira.py` | Jira ingestion pipeline (full, incremental sync, and smart diff update); indexes ticket comments as separate documents |
+| `ingest/chunking.py` | Token-aware text splitter (1500 tokens / 300 overlap for docs; 600 / 100 for Jira) |
 | `rag/retriever.py` | Hybrid BM25 + vector search with cross-encoder reranker |
 | `rag/query_expander.py` | LLM-driven query expansion — generates 5 query variants |
 | `rag/jira_clusterer.py` | Groups related Jira tickets for cleaner, deduplicated answers |
 | `rag/prompt_builder.py` | Builds the final GPT prompt with doc + Jira context |
-| `rag/conversation_memory.py` | Per-session conversation history manager |
+| `rag/conversation_memory.py` | Per-session server-side conversation history manager |
 | `rag/connector_detector.py` | Detects Arc connector/component references in queries |
 | `rag/query_router.py` | Routes queries to docs-only, Jira-only, or hybrid retrieval |
 | `rag/reranker.py` | Cross-encoder reranker wrapper (`ms-marco-MiniLM-L-6-v2`) |
-| `vector_db/chroma_store.py` | ChromaDB + BM25 store — two collections, BM25 append-mode incremental sync |
+| `vector_db/chroma_store.py` | ChromaDB + BM25 store — two collections, BM25 append-mode incremental sync, smart-diff helpers |
 | `static/index.html` | Chat UI — live progress bar for both doc and Jira indexing |
+| `logs/query_log.jsonl` | Auto-created JSONL query log — records every question with expanded queries, retrieved count, and answer preview |
 | `.env` | Local config — **never commit** (contains your API keys) |
 | `Dockerfile` | Two-stage container build (builder + lean runtime, reranker pre-downloaded) |
 | `docker-compose.yml` | Run the full app with one command |
@@ -179,8 +180,10 @@ Stop: `docker compose down`
 |---|---|---|
 | `/` | GET | Serves the chat UI |
 | `/api/status` | GET | Returns vector counts (`docs_vectors`, `jira_vectors`, `total_vectors`) |
-| `/api/ingest` | POST | Index / re-index HTML documentation |
+| `/api/ingest` | POST | Full index / re-index HTML documentation |
+| `/api/ingest/update` | POST | **Smart incremental docs update** — SHA-256 diff, only re-indexes new or changed files |
 | `/api/ingest/jira` | POST | Full index / re-index of Jira project |
+| `/api/ingest/jira/update` | POST | **Smart incremental Jira update** — content-hash diff, only re-indexes new or changed tickets |
 | `/api/ingest/jira/sync` | POST | Incremental sync — fetches only issues updated in the last N hours |
 | `/api/ingest/progress` | GET | Live progress (chunks done / total) during doc or Jira indexing |
 | `/api/chat` | POST | Ask a question, get a full answer with sources (blocking) |
@@ -212,9 +215,13 @@ Stop: `docker compose down`
 
 ### Indexing
 
-**Docs** — HTML files are parsed by BeautifulSoup, split into 1500-token chunks with 300-token overlap, embedded with `text-embedding-3-large`, and stored in the `arcmind_docs` ChromaDB collection. A companion BM25 index is pickled alongside. A `MAX_CRAWL_PAGES` cap prevents unbounded web crawls. Live progress is streamed via `/api/ingest/progress` and shown in the UI progress bar.
+**Docs** — HTML files are parsed by BeautifulSoup, split into 1,500-token chunks with 300-token overlap, embedded with `text-embedding-3-large`, and stored in the `arcmind_docs` ChromaDB collection. A companion BM25 index is pickled alongside. A `MAX_CRAWL_PAGES` cap prevents unbounded web crawls. Live progress is streamed via `/api/ingest/progress` and shown in the UI progress bar.
 
-**Jira** — All issues are fetched via Jira REST API v3 with cursor-based pagination (so all tickets are retrieved regardless of project size). Each issue is formatted as structured text (key, summary, type, status, priority, description, comments, fix versions, sprint) then chunked and embedded into the `arcmind_jira` collection. The BM25 index uses **append mode** during incremental syncs to avoid a full rebuild. Use `/api/ingest/jira/sync` for fast incremental updates.
+**Smart docs update** (`/api/ingest/update`) — Git-style diff: computes a SHA-256 hash of each document's content and compares it against the stored index. Only new and changed files are re-embedded; deleted files are removed from the store. Unchanged files incur zero embedding cost.
+
+**Jira** — All issues are fetched via Jira REST API v3 with cursor-based pagination. Each issue produces **two types of documents**: a main ticket document (key, summary, type, status, priority, description) and one separate document per comment (prefixed with the ticket header for independent searchability). Issues are chunked at 600 tokens / 100 overlap and embedded into the `arcmind_jira` collection. The BM25 index uses **append mode** during incremental syncs.
+
+**Smart Jira update** (`/api/ingest/jira/update`) — Fetches all tickets, computes a SHA-256 content hash per ticket (text + comments), and diffs against the stored state. New and changed tickets are re-embedded; tickets deleted in Jira are removed from the store. Unchanged tickets are skipped entirely.
 
 ### Querying
 
@@ -224,6 +231,8 @@ Stop: `docker compose down`
 4. **Hybrid retrieval** — Each variant is searched across both ChromaDB (semantic) and BM25 (keyword). Results are merged and deduplicated.
 5. **Reranking** — A local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores all candidates against the original question. Top `RERANKER_TOP_N` chunks are kept.
 6. **Answer generation** — Top doc chunks and a clustered Jira summary are injected into a strict prompt and sent to `gpt-4.1`. Streaming is available via `/api/chat/stream`.
+7. **Session memory** — When a `session_id` is provided, server-side conversation history is maintained per session across multiple turns.
+8. **Query logging** — Every question is appended to `logs/query_log.jsonl` with the expanded queries, retrieval counts, and answer preview for self-improvement analysis.
 
 ---
 
@@ -239,11 +248,12 @@ Stop: `docker compose down`
 | `CHUNK_SIZE` | `1500` | Tokens per chunk |
 | `CHUNK_OVERLAP` | `300` | Token overlap between chunks |
 | `RETRIEVER_TOP_K` | `15` | Candidates fetched from each collection before reranking |
-| `DOCS_TOP_K` | `8` | Doc chunks passed to GPT after reranking |
-| `JIRA_TOP_K` | `6` | Jira chunks passed to GPT after reranking |
+| `DOCS_TOP_K` | `6` | Doc chunks passed to GPT after reranking |
+| `JIRA_TOP_K` | `4` | Jira chunks passed to GPT after reranking |
 | `RERANKER_ENABLED` | `true` | Toggle cross-encoder reranker |
 | `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
-| `RERANKER_TOP_N` | `8` | Total chunks passed to GPT after reranking |
+| `RERANKER_TOP_N` | `5` | Total chunks passed to GPT after reranking |
+| `LOG_DIR` | `./logs` | Directory for `query_log.jsonl` |
 | `MAX_CRAWL_PAGES` | `2000` | Max pages fetched during a web crawl |
 | `CHROMA_DB_DIR` | `./chroma_db` | Vector store and BM25 pickle location |
 | `JIRA_URL` | — | Atlassian Cloud URL (e.g. `https://your-org.atlassian.net`) |

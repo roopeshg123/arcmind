@@ -30,7 +30,8 @@ load_dotenv()
 
 import rag_engine
 from ingest import run_ingestion
-from ingest.ingest_jira import ingest_jira_async, incremental_jira_sync_async
+from ingest.ingest_jira import ingest_jira_async, incremental_jira_sync_async, smart_jira_update_async
+from ingest.ingest_docs import smart_docs_update
 
 DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 
@@ -216,7 +217,7 @@ async def ingest(request: IngestRequest):
         try:
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
-                functools.partial(run_ingestion, docs_dir=docs_dir, reset=request.reset),
+                functools.partial(run_ingestion, docs_dir=docs_dir, reset=request.reset, progress=_ingest_progress),
             )
         finally:
             _ingest_progress = {
@@ -249,6 +250,67 @@ async def ingest_jira(request: JiraIngestRequest):
                 reset=request.reset,
                 progress=_ingest_progress,
             )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
+
+    return result
+
+
+@app.post("/api/ingest/update")
+async def ingest_update(request: IngestRequest):
+    """Smart incremental docs update — only re-indexes changed or new files."""
+    global _ingest_progress
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+
+    docs_dir = request.docs_dir or DOCS_DIR
+
+    result = None
+    async with _ingestion_lock:
+        _ingest_progress = {
+            "stage": "loading", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
+        rag_engine.reset_chain()
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    smart_docs_update,
+                    docs_dir=docs_dir,
+                    progress=_ingest_progress,
+                ),
+            )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
+
+    if result.get("status") == "error":
+        raise HTTPException(status_code=422, detail=result.get("message"))
+
+    return result
+
+
+@app.post("/api/ingest/jira/update")
+async def jira_smart_update():
+    """Smart incremental Jira update — only re-indexes new or changed tickets."""
+    global _ingest_progress
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+
+    result = None
+    async with _ingestion_lock:
+        _ingest_progress = {
+            "stage": "fetching", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
+        try:
+            result = await smart_jira_update_async(progress=_ingest_progress)
         finally:
             _ingest_progress = {
                 "stage": "idle", "fetched": 0, "total": 0,

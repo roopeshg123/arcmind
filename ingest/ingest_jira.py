@@ -13,6 +13,8 @@ Supports:
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
 import logging
 import os
 import re
@@ -117,15 +119,24 @@ def issues_to_documents(issues: list[dict]) -> list[Document]:
             text=f"{issue.get('summary', '')} {issue.get('description', '')}",
             components=issue.get("components", []),
         )
+        # Content hash — covers ALL ticket fields (status, comments, description…).
+        # Two tickets with identical text but different comments will produce
+        # different hashes because comment_items are embedded in the hash seed.
+        hash_seed = text + "".join(
+            c["author"] + c["body"]
+            for c in issue.get("comment_items", [])
+        )
+        ticket_hash = hashlib.sha256(hash_seed.encode()).hexdigest()
         base_meta = {
-            "source":    "jira",
-            "ticket":    issue.get("key", ""),
-            "summary":   issue.get("summary") or "",
-            "type":      (issue.get("issue_type") or "").lower(),
-            "status":    (issue.get("status") or "").lower(),
-            "component": connector,
-            "created":   issue.get("created", ""),
-            "updated":   issue.get("updated", ""),
+            "source":      "jira",
+            "ticket":      issue.get("key", ""),
+            "summary":     issue.get("summary") or "",
+            "type":        (issue.get("issue_type") or "").lower(),
+            "status":      (issue.get("status") or "").lower(),
+            "component":   connector,
+            "created":     issue.get("created", ""),
+            "updated":     issue.get("updated", ""),
+            "ticket_hash": ticket_hash,
         }
         # --- main ticket document (description only) ---
         docs.append(Document(page_content=text, metadata=base_meta))
@@ -216,7 +227,11 @@ async def ingest_jira_async(
             progress["chunks_total"] = total
 
     store = get_store()
-    count = store.add_jira_batch(chunks, reset=reset, on_progress=_on_embed_progress)
+    loop  = asyncio.get_running_loop()
+    count = await loop.run_in_executor(
+        None,
+        functools.partial(store.add_jira_batch, chunks, reset=reset, on_progress=_on_embed_progress),
+    )
 
     if progress is not None:
         progress.update({"stage": "done", "vectors": count})
@@ -263,3 +278,180 @@ def incremental_jira_sync(hours: int = 1) -> dict:
     Synchronous wrapper for CLI use only.
     """
     return asyncio.run(incremental_jira_sync_async(hours=hours))
+
+
+async def smart_jira_update_async(
+    progress: dict | None = None,
+) -> dict:
+    """
+    Smart incremental Jira update — Git-style diff.
+
+    Steps
+    -----
+    1. Fetch ALL issues from Jira (same scope as full ingest).
+    2. Compare each ticket's ``updated`` timestamp against what is stored in
+       ChromaDB.
+    3. New tickets      → ingest.
+       Changed tickets  → delete old chunks + ingest fresh.
+       Deleted tickets  → delete chunks from DB (ticket no longer exists in
+                          Jira but is still in the DB).
+       Unchanged tickets → skip entirely (no API cost, no embedding cost).
+    4. Rebuild BM25 only if anything changed.
+
+    Returns a status dict with detailed counts.
+    """
+    jql = f"project = {JIRA_PROJECT_KEY} ORDER BY updated DESC"
+
+    if progress is not None:
+        progress.update({"stage": "fetching", "fetched": 0, "total": 0, "vectors": 0})
+
+    def _on_page(fetched: int) -> None:
+        if progress is not None:
+            progress["fetched"] = fetched
+
+    log.info("Smart Jira update — fetching all issues.  JQL: %s", jql)
+    issues = await fetch_issues(jql=jql, max_results=0, on_progress=_on_page)
+
+    if not issues:
+        log.warning("Smart Jira update: no issues fetched — check credentials / JQL.")
+        return {
+            "status":           "ok",
+            "message":          "No Jira issues fetched. Check credentials / JQL.",
+            "new_tickets":      0,
+            "updated_tickets":  0,
+            "removed_tickets":  0,
+            "unchanged_tickets":0,
+            "chunks_created":   0,
+            "vectors_stored":   0,
+        }
+
+    if progress is not None:
+        progress.update({"stage": "comparing", "total": len(issues)})
+
+    # --- Build lookup: ticket_key → updated timestamp from Jira ---
+    fetched_map: dict[str, dict] = {iss["key"]: iss for iss in issues}
+
+    # --- Get existing state from ChromaDB ---
+    store = get_store()
+    loop  = asyncio.get_running_loop()
+    existing_state: dict[str, dict] = await loop.run_in_executor(
+        None, store.get_existing_jira_state
+    )
+
+    # Pre-compute content hashes for every fetched issue so we can diff
+    # without re-formatting each ticket twice.
+    def _issue_hash(issue: dict) -> str:
+        text = _format_ticket_text(issue) or ""
+        seed = text + "".join(
+            c["author"] + c["body"]
+            for c in issue.get("comment_items", [])
+        )
+        return hashlib.sha256(seed.encode()).hexdigest()
+
+    # --- Diff ---
+    new_keys:     list[str] = []
+    changed_keys: list[str] = []
+    removed_keys: list[str] = []
+
+    for key, issue in fetched_map.items():
+        if key not in existing_state:
+            new_keys.append(key)
+        else:
+            stored = existing_state[key]
+            stored_hash    = stored.get("hash", "")
+            stored_updated = stored.get("updated", "")
+            if stored_hash:
+                # Reliable: compare full content hash (immune to tz format drift)
+                if _issue_hash(issue) != stored_hash:
+                    changed_keys.append(key)
+            else:
+                # Legacy fallback: chunks indexed before ticket_hash was added
+                # — compare updated timestamp strings.
+                if (issue.get("updated") or "") > stored_updated:
+                    changed_keys.append(key)
+
+    for key in existing_state:
+        if key not in fetched_map:
+            removed_keys.append(key)
+
+    to_ingest_keys = new_keys + changed_keys
+    log.info(
+        "Smart Jira diff: %d new, %d changed, %d removed, %d unchanged.",
+        len(new_keys), len(changed_keys), len(removed_keys),
+        len(issues) - len(new_keys) - len(changed_keys),
+    )
+
+    vectors_stored = store.jira_count()  # default — will update if we change anything
+
+    if not to_ingest_keys and not removed_keys:
+        return {
+            "status":            "ok",
+            "message":           "Everything is already up to date.",
+            "new_tickets":       0,
+            "updated_tickets":   0,
+            "removed_tickets":   0,
+            "unchanged_tickets": len(issues),
+            "chunks_created":    0,
+            "vectors_stored":    vectors_stored,
+        }
+
+    # --- Delete changed + removed tickets from ChromaDB ---
+    keys_to_delete = changed_keys + removed_keys
+    if keys_to_delete:
+        log.info("Deleting %d ticket(s) from ChromaDB.", len(keys_to_delete))
+        await loop.run_in_executor(
+            None,
+            functools.partial(store.delete_jira_tickets, keys_to_delete),
+        )
+
+    # --- Ingest new + changed tickets ---
+    chunks_created = 0
+    if to_ingest_keys:
+        to_ingest_issues = [fetched_map[k] for k in to_ingest_keys]
+        documents  = issues_to_documents(to_ingest_issues)
+        chunks     = chunk_documents(documents, chunk_size=600, chunk_overlap=100)
+        chunks_created = len(chunks)
+
+        if progress is not None:
+            progress.update({
+                "stage":        "embedding",
+                "fetched":      len(issues),
+                "total":        len(issues),
+                "chunks_total": chunks_created,
+                "chunks_done":  0,
+            })
+
+        def _on_embed_progress(done: int, total: int) -> None:
+            if progress is not None:
+                progress["chunks_done"]  = done
+                progress["chunks_total"] = total
+
+        vectors_stored = await loop.run_in_executor(
+            None,
+            # reset=False — we already deleted the stale chunks above
+            functools.partial(store.add_jira_batch, chunks, False, _on_embed_progress),
+        )
+    else:
+        # Only removals — rebuild BM25 to purge deleted entries
+        await loop.run_in_executor(
+            None,
+            functools.partial(store._build_bm25, "arcmind_jira", None),
+        )
+        vectors_stored = store.jira_count()
+
+    if progress is not None:
+        progress.update({"stage": "done", "vectors": vectors_stored})
+
+    log.info(
+        "Smart Jira update complete: +%d new, ~%d updated, -%d removed → %d vectors.",
+        len(new_keys), len(changed_keys), len(removed_keys), vectors_stored,
+    )
+    return {
+        "status":            "ok",
+        "new_tickets":       len(new_keys),
+        "updated_tickets":   len(changed_keys),
+        "removed_tickets":   len(removed_keys),
+        "unchanged_tickets": len(issues) - len(new_keys) - len(changed_keys),
+        "chunks_created":    chunks_created,
+        "vectors_stored":    vectors_stored,
+    }

@@ -244,7 +244,7 @@ def load_documents_from_dir(docs_dir: str) -> list[Document]:
 # Public pipeline entry point
 # ---------------------------------------------------------------------------
 
-def ingest_docs(docs_dir: str | None = None, reset: bool = True) -> dict:
+def ingest_docs(docs_dir: str | None = None, reset: bool = True, progress: dict | None = None) -> dict:
     """
     Full documentation ingestion pipeline.
 
@@ -253,6 +253,7 @@ def ingest_docs(docs_dir: str | None = None, reset: bool = True) -> dict:
     Args:
         docs_dir: Override for DOCS_DIR env var.
         reset:    If True, drop the existing docs collection before ingesting.
+        progress: Optional dict updated in-place with live progress info.
 
     Returns:
         Status dict with counts.
@@ -279,8 +280,21 @@ def ingest_docs(docs_dir: str | None = None, reset: bool = True) -> dict:
         }
 
     chunks = chunk_documents(documents)
+
+    if progress is not None:
+        progress.update({
+            "stage":        "embedding",
+            "chunks_total": len(chunks),
+            "chunks_done":  0,
+        })
+
+    def _on_embed_progress(done: int, total: int) -> None:
+        if progress is not None:
+            progress["chunks_done"]  = done
+            progress["chunks_total"] = total
+
     store  = get_store()
-    count  = store.add_docs_batch(chunks, reset=reset)
+    count  = store.add_docs_batch(chunks, reset=reset, on_progress=_on_embed_progress)
 
     return {
         "status":        "ok",
@@ -288,4 +302,164 @@ def ingest_docs(docs_dir: str | None = None, reset: bool = True) -> dict:
         "files_loaded":  len(documents),
         "chunks_created": len(chunks),
         "vectors_stored": count,
+    }
+
+
+def smart_docs_update(docs_dir: str | None = None, progress: dict | None = None) -> dict:
+    """
+    Smart incremental documentation update — Git-style diff.
+
+    Steps
+    -----
+    1. Load all HTML documents from disk / DOCS_URL (same as full ingest).
+    2. Compute a SHA-256 content hash for each loaded document.
+    3. Compare against the hashes stored in ChromaDB (or computed on-the-fly
+       from stored text for legacy chunks that pre-date this feature).
+    4. New sources     → ingest.
+       Changed sources → delete old chunks + ingest fresh.
+       Removed sources → delete chunks (file deleted from disk / site).
+       Unchanged       → skip entirely (no embedding cost).
+    5. Persist the content_hash in chunk metadata so future runs are fast.
+
+    Returns a status dict with detailed counts.
+    """
+    import hashlib
+
+    load_dotenv(override=True)
+    docs_url      = os.getenv("DOCS_URL", "").strip()
+    effective_dir = docs_dir or os.getenv("DOCS_DIR", DOCS_DIR)
+
+    if progress is not None:
+        progress.update({"stage": "loading", "fetched": 0, "total": 0, "vectors": 0})
+
+    if docs_url:
+        log.info("DOCS_URL set — crawling for smart update: %s", docs_url)
+        documents    = crawl_site(docs_url)
+        source_label = docs_url
+    else:
+        documents    = load_documents_from_dir(effective_dir)
+        source_label = effective_dir
+
+    if not documents:
+        return {
+            "status":          "error",
+            "message":         f"No documents found in '{source_label}'.",
+            "new_files":       0,
+            "updated_files":   0,
+            "removed_files":   0,
+            "unchanged_files": 0,
+            "chunks_created":  0,
+            "vectors_stored":  0,
+        }
+
+    # --- Compute hashes for each loaded document ---
+    # source_id: file_path (disk) or url (web)
+    def _source_id(doc: Document) -> str:
+        return doc.metadata.get("file_path") or doc.metadata.get("url") or ""
+
+    loaded_map: dict[str, Document] = {}
+    loaded_hashes: dict[str, str]   = {}
+    for doc in documents:
+        sid = _source_id(doc)
+        if not sid:
+            continue
+        loaded_map[sid]    = doc
+        loaded_hashes[sid] = hashlib.sha256(doc.page_content.encode()).hexdigest()
+
+    # --- Get existing state from ChromaDB ---
+    store          = get_store()
+    existing_index = store.get_existing_docs_index()   # {source_id: content_hash}
+
+    # --- Diff ---
+    new_ids:     list[str] = []
+    changed_ids: list[str] = []
+    removed_ids: list[str] = []
+
+    for sid, new_hash in loaded_hashes.items():
+        if sid not in existing_index:
+            new_ids.append(sid)
+        elif existing_index[sid] != new_hash:
+            changed_ids.append(sid)
+        # else: unchanged
+
+    for sid in existing_index:
+        if sid not in loaded_hashes:
+            removed_ids.append(sid)
+
+    to_ingest_ids = new_ids + changed_ids
+    unchanged_count = len(documents) - len(new_ids) - len(changed_ids)
+
+    log.info(
+        "Smart docs diff: %d new, %d changed, %d removed, %d unchanged.",
+        len(new_ids), len(changed_ids), len(removed_ids), unchanged_count,
+    )
+
+    vectors_stored = store.docs_count()  # default — will update if anything changes
+
+    if not to_ingest_ids and not removed_ids:
+        return {
+            "status":          "ok",
+            "message":         "Everything is already up to date.",
+            "new_files":       0,
+            "updated_files":   0,
+            "removed_files":   0,
+            "unchanged_files": unchanged_count,
+            "chunks_created":  0,
+            "vectors_stored":  vectors_stored,
+        }
+
+    # --- Delete changed + removed sources from ChromaDB ---
+    ids_to_delete = changed_ids + removed_ids
+    if ids_to_delete:
+        log.info("Deleting %d doc source(s) from ChromaDB.", len(ids_to_delete))
+        store.delete_docs_by_source_id(ids_to_delete)
+
+    # --- Ingest new + changed documents, stamping content_hash in metadata ---
+    chunks_created = 0
+    if to_ingest_ids:
+        to_ingest_docs = []
+        for sid in to_ingest_ids:
+            doc = loaded_map[sid]
+            # Stamp the hash so future runs can compare cheaply
+            doc.metadata["content_hash"] = loaded_hashes[sid]
+            to_ingest_docs.append(doc)
+
+        chunks = chunk_documents(to_ingest_docs)
+        chunks_created = len(chunks)
+
+        if progress is not None:
+            progress.update({
+                "stage":        "embedding",
+                "chunks_total": chunks_created,
+                "chunks_done":  0,
+            })
+
+        def _on_embed_progress(done: int, total: int) -> None:
+            if progress is not None:
+                progress["chunks_done"]  = done
+                progress["chunks_total"] = total
+
+        # reset=False — we already deleted the stale chunks above
+        vectors_stored = store.add_docs_batch(chunks, reset=False, on_progress=_on_embed_progress)
+    else:
+        # Only removals — rebuild BM25 to purge deleted entries
+        store._build_bm25("arcmind_docs", new_docs=None)
+        vectors_stored = store.docs_count()
+
+    if progress is not None:
+        progress.update({"stage": "done", "vectors": vectors_stored})
+
+    log.info(
+        "Smart docs update complete: +%d new, ~%d updated, -%d removed → %d vectors.",
+        len(new_ids), len(changed_ids), len(removed_ids), vectors_stored,
+    )
+    return {
+        "status":          "ok",
+        "source":          source_label,
+        "new_files":       len(new_ids),
+        "updated_files":   len(changed_ids),
+        "removed_files":   len(removed_ids),
+        "unchanged_files": unchanged_count,
+        "chunks_created":  chunks_created,
+        "vectors_stored":  vectors_stored,
     }

@@ -206,9 +206,12 @@ INDEXING PHASE (runs once when you click ⚡ Index Docs):
   Step 2: SPLIT
     ┌─────────────────────────────────────────┐
     │  Each file's text is split into chunks  │
-    │   - Chunk size:    1500 characters      │
-    │   - Overlap:        300 characters      │
-    │  540 files → 4179 chunks                │
+    │   - Docs chunk size:   1500 tokens      │
+    │   - Docs overlap:       300 tokens      │
+    │   - Jira chunk size:    600 tokens      │
+    │   - Jira overlap:       100 tokens      │
+    │  540 files → ~2,800 doc chunks          │
+    │  Jira: one main doc + per-comment docs  │
     └─────────────────────────────────────────┘
 
   Step 3: EMBED  (OpenAI Embeddings API called here)
@@ -241,6 +244,16 @@ QUERY PHASE (runs every time you ask a question):
     │  GPT rewrites:                          │
     │  "How do I authenticate the REST        │
     │   connector in Arc?"                    │
+    └─────────────────────────────────────────┘
+
+  Step 1b: SESSION MEMORY LOOKUP
+    ┌─────────────────────────────────────────┐
+    │  If session_id is provided:             │
+    │  conversation_memory.py loads stored    │
+    │  history for that session (in-memory,   │
+    │  keyed by session_id, max 128 chars).   │
+    │  History is merged with any passed-in   │
+    │  chat_history for context.              │
     └─────────────────────────────────────────┘
 
   Step 2: CONNECTOR DETECTION + QUERY ROUTING
@@ -305,10 +318,18 @@ QUERY PHASE (runs every time you ask a question):
     │  Streaming available via /api/chat/stream│
     └─────────────────────────────────────────┘
 
-  Step 7: RETURN
+  Step 7: RETURN + LOG
     ┌─────────────────────────────────────────┐
     │  Answer text sent back to browser       │
     │  Source files listed below the answer   │
+    │                                         │
+    │  _log_query() appends a JSON record to  │
+    │  logs/query_log.jsonl:                  │
+    │   {ts, question, expanded_queries,      │
+    │    docs_retrieved, jira_retrieved,      │
+    │    answer_preview (first 500 chars)}    │
+    │                                         │
+    │  session_id memory updated if provided  │
     └─────────────────────────────────────────┘
 
 
@@ -330,7 +351,8 @@ QUERY PHASE (runs every time you ask a question):
   │                             CORS via CORS_ORIGINS env var
   │                             Session-id validation (max 128 chars)
   │                             Routes: /api/chat, /api/chat/stream,
-  │                             /api/ingest, /api/ingest/jira,
+  │                             /api/ingest, /api/ingest/update,
+  │                             /api/ingest/jira, /api/ingest/jira/update,
   │                             /api/ingest/jira/sync, /api/ingest/progress,
   │                             /api/status
   │
@@ -339,6 +361,9 @@ QUERY PHASE (runs every time you ask a question):
   │                             Async-safe: wraps pipeline in run_in_executor
   │                             Configurable top-k via DOCS_TOP_K/JIRA_TOP_K
   │                             reset_chain() clears LLM + chain singletons
+  │                             ask_stream() — async generator for SSE streaming
+  │                             _log_query() — appends JSONL to logs/ per query
+  │                             session_id support via conversation_memory
   │
   ├── connectors/
   │   └── jira_client.py      ← Jira REST API v3 client
@@ -355,12 +380,24 @@ QUERY PHASE (runs every time you ask a question):
   │   │                         MAX_CRAWL_PAGES cap (prevents unbounded crawls)
   │   │                         Progress reported to _ingest_progress during embed
   │   │                         BeautifulSoup strips noise → chunk → embed → store
+  │   │                         smart_docs_update() — SHA-256 content diff:
+  │   │                           new sources → ingest
+  │   │                           changed sources → delete old + ingest fresh
+  │   │                           removed sources → delete from store
+  │   │                           unchanged → skip entirely (zero embed cost)
   │   ├── ingest_jira.py      ← Jira ingestion pipeline (full + incremental sync)
   │   │                         ingest_jira_async() — full re-index
   │   │                         incremental_jira_sync_async() — last N hours only
+  │   │                         smart_jira_update_async() — SHA-256 content diff
+  │   │                           same new/changed/removed logic as docs
+  │   │                           falls back to updated timestamp for legacy chunks
   │   │                         BM25 append mode on sync (no full rebuild)
+  │   │                         Comment indexing: each ticket comment is stored
+  │   │                           as a separate Document prefixed with ticket header
+  │   │                           (independently searchable, full context preserved)
   │   └── chunking.py         ← Token-aware RecursiveCharacterTextSplitter
-  │                             1500 tokens / 300 token overlap
+  │                             1500 tokens / 300 token overlap (docs)
+  │                             600 tokens / 100 token overlap (Jira)
   │
   ├── rag/
   │   ├── __init__.py
@@ -377,7 +414,8 @@ QUERY PHASE (runs every time you ask a question):
   │   ├── reranker.py         ← Cross-encoder reranker wrapper
   │   │                         ms-marco-MiniLM-L-6-v2 (cached locally, ~22MB)
   │   ├── prompt_builder.py   ← Assembles final GPT prompt with doc + jira context
-  │   └── conversation_memory.py ← Conversation history (in-memory, per session)
+  │   └── conversation_memory.py ← Server-side per-session conversation history
+  │                               Keyed by session_id (max 128 chars, alphanumeric)
   │
   ├── vector_db/
   │   ├── __init__.py
@@ -387,6 +425,9 @@ QUERY PHASE (runs every time you ask a question):
   │                             Plus companion BM25 Okapi pickle per collection
   │                             _safe_pickle_load path-validation (security)
   │                             BM25 append mode for incremental Jira syncs
+  │                             get_existing_docs_index() — {source_id: hash}
+  │                             get_existing_jira_state() — {key: {hash, updated}}
+  │                             delete_jira_tickets() — removes chunks by ticket key
   │
   ├── static/
   │   └── index.html          ← Full chat UI (HTML + CSS + JS, no frameworks)
@@ -394,6 +435,11 @@ QUERY PHASE (runs every time you ask a question):
   │                             Polls /api/ingest/progress during any ingestion
   │                             Status badge: docs: X, jira: Y vectors
   │                             Streaming chat via /api/chat/stream (SSE)
+  │
+  ├── logs/
+  │   └── query_log.jsonl     ← Auto-created JSONL query log
+  │                             Fields: ts, question, expanded_queries,
+  │                             docs_retrieved, jira_retrieved, answer_preview
   │
   ├── chroma_db/              ← Auto-created after first indexing
   │                             SQLite + BM25 pickles (bm25_docs.pkl, bm25_jira.pkl)
@@ -546,21 +592,20 @@ QUERY PHASE (runs every time you ask a question):
   ╔══════════════════════════════════════════════════════════════════════════╗
   ║                     FASTAPI BACKEND  (main.py)                          ║
   ║                                                                          ║
-  ║   GET  /                    →  serves static/index.html                 ║
-  ║   GET  /api/status          →  docs_vectors, jira_vectors, total        ║
-  ║   POST /api/ingest          →  ingest_docs_async()                      ║
-  ║   POST /api/ingest/jira     →  ingest_jira_async() (full re-index)      ║
-  ║   POST /api/ingest/jira/sync→  incremental_jira_sync_async()            ║
-  ║   GET  /api/ingest/progress →  live chunks_done / chunks_total          ║
-  ║   POST /api/chat            →  rag_engine.ask() (blocking)              ║
-  ║   POST /api/chat/stream     →  rag_engine.ask_stream() (SSE)            ║
+  ║   GET  /                       →  serves static/index.html              ║
+  ║   GET  /api/status             →  docs_vectors, jira_vectors, total     ║
+  ║   POST /api/ingest             →  ingest_docs_async() (full re-index)   ║
+  ║   POST /api/ingest/update      →  smart_docs_update() (SHA-256 diff)    ║
+  ║   POST /api/ingest/jira        →  ingest_jira_async() (full re-index)   ║
+  ║   POST /api/ingest/jira/update →  smart_jira_update_async() (hash diff) ║
+  ║   POST /api/ingest/jira/sync   →  incremental_jira_sync_async()         ║
+  ║   GET  /api/ingest/progress    →  live chunks_done / chunks_total       ║
+  ║   POST /api/chat               →  rag_engine.ask() (blocking)           ║
+  ║   POST /api/chat/stream        →  rag_engine.ask_stream() (SSE)         ║
   ║                                                                          ║
   ║   Security: asyncio.Lock guards ingest endpoints (no race conditions)   ║
   ║   Auth:     X-API-Key middleware (when API_KEY env var is set)          ║
   ║   CORS:     configurable via CORS_ORIGINS env var                       ║
-  ║   POST /api/ingest/jira     →  ingest_jira_async()                      ║
-  ║   GET  /api/ingest/progress →  live fetched/total counter               ║
-  ║   POST /api/chat            →  rag.engine.ask()                         ║
   ╚═══════════════╤═════════════════════════╤══════════════╤════════════════╝
                   │                         │              │
                   ▼                         ▼              ▼
@@ -609,8 +654,8 @@ QUERY PHASE (runs every time you ask a question):
                    ║  OpenAI API                            ║
                    ║  /v1/embeddings  text-embedding-3-large║
                    ║  /v1/chat/completions  gpt-4.1         ║
-                   ║  /v1/chat/completions  gpt-4o-mini     ║
-                   ║                       (query expansion)║
+                   ║                       (answers +        ║
+                   ║                        query expansion) ║
                    ╚════════════════════════════════════════╝
 
 
@@ -714,8 +759,8 @@ HTTP Response:
 Cost: gpt-4.1 — ~$0.002 per 1000 input tokens + $0.008 per 1000 output tokens
       A typical question with 2000 tokens context costs ~$0.005 (~0.5 paise)
 
-  Note: gpt-4o-mini is used separately for query expansion (cheap call,
-  ~200 tokens, less than $0.0001 per question).
+  Note: gpt-4.1 is also used for query expansion (CHAT_MODEL singleton,
+  ~200 tokens per call).
 
 
 ════════════════════════════════════════════════════════════════════════════════

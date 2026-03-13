@@ -413,6 +413,121 @@ class ChromaStore:
         except Exception:
             return 0
 
+    # ------------------------------------------------------------------
+    # Smart incremental update helpers
+    # ------------------------------------------------------------------
+
+    def get_existing_jira_state(self) -> dict[str, dict]:
+        """
+        Return {ticket_key: {"updated": timestamp, "hash": content_hash}}
+        for every ticket currently stored in the Jira collection.
+
+        Fetches in batches of 5,000 so it works reliably on large collections
+        regardless of ChromaDB version.  "ticket_hash" is stored by the new
+        ingestion code; legacy chunks without it fall back to timestamp-only
+        comparison.
+        """
+        store      = self._get_store(JIRA_COLLECTION)
+        result:    dict[str, dict] = {}
+        batch_size = 5000
+        offset     = 0
+        try:
+            while True:
+                raw   = store._collection.get(
+                    include=["metadatas"],
+                    limit=batch_size,
+                    offset=offset,
+                )
+                metas = raw.get("metadatas") or []
+                if not metas:
+                    break
+                for meta in metas:
+                    if not meta:
+                        continue
+                    key     = meta.get("ticket", "")
+                    updated = meta.get("updated", "") or ""
+                    thash   = meta.get("ticket_hash", "") or ""
+                    if not key:
+                        continue
+                    # Keep the record with the highest updated timestamp
+                    # (all chunks for one ticket share the same values, but
+                    # this is defensive against any inconsistency).
+                    if key not in result or updated > result[key]["updated"]:
+                        result[key] = {"updated": updated, "hash": thash}
+                if len(metas) < batch_size:
+                    break
+                offset += batch_size
+            log.info(
+                "Jira index snapshot: %d unique tickets read from ChromaDB.",
+                len(result),
+            )
+            return result
+        except Exception as exc:
+            log.error("Failed to read existing Jira state: %s", exc)
+            return {}
+
+    def delete_jira_tickets(self, ticket_keys: list[str]) -> None:
+        """Delete ALL ChromaDB chunks for the given Jira ticket keys."""
+        if not ticket_keys:
+            return
+        store = self._get_store(JIRA_COLLECTION)
+        for key in ticket_keys:
+            try:
+                store._collection.delete(where={"ticket": key})
+                log.debug("Deleted chunks for Jira ticket %s.", key)
+            except Exception as exc:
+                log.warning("Could not delete ticket %s: %s", key, exc)
+
+    def get_existing_docs_index(self) -> dict[str, str]:
+        """
+        Return {source_id: content_hash} for every document chunk currently
+        stored in the docs collection.
+
+        source_id is ``file_path`` for disk-loaded files, or ``url`` for
+        web-crawled pages.  content_hash is the stored SHA-256 hex digest
+        (added by the smart-update path); for chunks without a stored hash,
+        we compute one from the stored text so old collections work too.
+        """
+        import hashlib
+        store = self._get_store(DOCS_COLLECTION)
+        try:
+            raw   = store._collection.get(include=["documents", "metadatas"])
+            texts = raw.get("documents") or []
+            metas = raw.get("metadatas") or []
+            result: dict[str, str] = {}
+            for text, meta in zip(texts, metas):
+                if not meta:
+                    continue
+                sid = meta.get("file_path") or meta.get("url") or ""
+                if not sid:
+                    continue
+                if sid in result:
+                    continue  # one hash per source is enough
+                stored_hash = meta.get("content_hash") or ""
+                if not stored_hash and text:
+                    stored_hash = hashlib.sha256(text.encode()).hexdigest()
+                result[sid] = stored_hash
+            return result
+        except Exception as exc:
+            log.error("Failed to read existing docs metadata: %s", exc)
+            return {}
+
+    def delete_docs_by_source_id(self, source_ids: list[str]) -> None:
+        """
+        Delete all doc chunks whose file_path OR url equals one of
+        *source_ids*.
+        """
+        if not source_ids:
+            return
+        store = self._get_store(DOCS_COLLECTION)
+        for sid in source_ids:
+            try:
+                # Try file_path first, then url
+                for field in ("file_path", "url"):
+                    store._collection.delete(where={field: sid})
+            except Exception as exc:
+                log.warning("Could not delete doc source '%s': %s", sid, exc)
+
     def release(self) -> None:
         """Free all ChromaDB handles (important on Windows to release SQLite locks)."""
         self._docs_store = None

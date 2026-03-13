@@ -5,8 +5,8 @@ from ingest.ingest_jira import ingest_jira as _ingest_jira, incremental_jira_syn
 import os
 
 
-def run_ingestion(docs_dir=None, reset=True):
-    return _ingest_docs(docs_dir=docs_dir, reset=reset)
+def run_ingestion(docs_dir=None, reset=True, progress=None):
+    return _ingest_docs(docs_dir=docs_dir, reset=reset, progress=progress)
 
 
 def run_jira_ingestion(jql=None, reset=False):

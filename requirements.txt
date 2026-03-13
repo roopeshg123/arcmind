@@ -1,3 +1,7 @@
+# Tells pip to also check PyTorch's CPU-only index.
+# Fetches the CPU build of torch (~200 MB) instead of the CUDA build (~2.5 GB).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # ── Web framework ───────────────────────────────────────────────────────────
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
