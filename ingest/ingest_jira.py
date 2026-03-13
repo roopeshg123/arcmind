@@ -94,12 +94,20 @@ def _format_ticket_text(issue: dict) -> str:
     if issue.get("description"):
         lines.extend(["", "Description:", _s(issue["description"])[:3000]])
 
-    if issue.get("comments"):
-        lines.extend(["", "Comments:", _s(issue["comments"])[:5000]])
+    # Comments are indexed as separate documents; omit them from the main body
+    # to avoid diluting the description chunk's semantic focus.
 
     return "\n".join(lines)
+
+
 def issues_to_documents(issues: list[dict]) -> list[Document]:
-    """Convert a list of Jira issue dicts to LangChain Documents."""
+    """Convert a list of Jira issue dicts to LangChain Documents.
+
+    Each ticket produces:
+      1. One main document (metadata + description, no comments).
+      2. One document per comment, prefixed with the ticket key + summary so
+         comment text is independently searchable in full context.
+    """
     docs: list[Document] = []
     for issue in issues:
         text = _format_ticket_text(issue) or ""
@@ -109,19 +117,39 @@ def issues_to_documents(issues: list[dict]) -> list[Document]:
             text=f"{issue.get('summary', '')} {issue.get('description', '')}",
             components=issue.get("components", []),
         )
-        docs.append(Document(
-            page_content=text,
-            metadata={
-                "source":    "jira",
-                "ticket":    issue.get("key", ""),
-                "summary":   issue.get("summary") or "",
-                "type":      (issue.get("issue_type") or "").lower(),
-                "status":    (issue.get("status") or "").lower(),
-                "component": connector,
-                "created":   issue.get("created", ""),
-                "updated":   issue.get("updated", ""),
-            },
-        ))
+        base_meta = {
+            "source":    "jira",
+            "ticket":    issue.get("key", ""),
+            "summary":   issue.get("summary") or "",
+            "type":      (issue.get("issue_type") or "").lower(),
+            "status":    (issue.get("status") or "").lower(),
+            "component": connector,
+            "created":   issue.get("created", ""),
+            "updated":   issue.get("updated", ""),
+        }
+        # --- main ticket document (description only) ---
+        docs.append(Document(page_content=text, metadata=base_meta))
+
+        # --- one document per comment ---
+        # Prefixing every comment with the ticket key + summary means the
+        # comment chunk will rank highly for queries that mention the ticket
+        # topic, even when the description chunk was not retrieved.
+        ticket_header = (
+            f"Ticket: {issue.get('key', '')}"
+            f"\nSummary: {issue.get('summary', '')}"
+            f"\nType: {(issue.get('issue_type') or '')}"
+            f"\nStatus: {(issue.get('status') or '')}"
+        )
+        for comment in issue.get("comment_items", []):
+            comment_text = (
+                f"{ticket_header}"
+                f"\n\nComment by {comment['author']}:"
+                f"\n{comment['body']}"
+            )
+            docs.append(Document(
+                page_content=comment_text,
+                metadata={**base_meta, "type": "comment"},
+            ))
     return docs
 
 
@@ -170,14 +198,25 @@ async def ingest_jira_async(
             "vectors_stored": 0,
         }
 
-    if progress is not None:
-        progress.update({"stage": "embedding", "fetched": len(issues), "total": len(issues)})
-
     documents = issues_to_documents(issues)
-    chunks = chunk_documents(documents, chunk_size=600, chunk_overlap=100)
+    chunks    = chunk_documents(documents, chunk_size=600, chunk_overlap=100)
+
+    if progress is not None:
+        progress.update({
+            "stage":        "embedding",
+            "fetched":      len(issues),
+            "total":        len(issues),
+            "chunks_total": len(chunks),
+            "chunks_done":  0,
+        })
+
+    def _on_embed_progress(done: int, total: int) -> None:
+        if progress is not None:
+            progress["chunks_done"]  = done
+            progress["chunks_total"] = total
 
     store = get_store()
-    count = store.add_jira_batch(chunks, reset=reset)
+    count = store.add_jira_batch(chunks, reset=reset, on_progress=_on_embed_progress)
 
     if progress is not None:
         progress.update({"stage": "done", "vectors": count})

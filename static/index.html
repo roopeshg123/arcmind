@@ -66,6 +66,33 @@
     #toolbar button:disabled { opacity: .4; cursor: not-allowed; }
     #ingest-status { font-size: .78rem; color: #888; }
 
+    /* -------------------------------------------------------------- progress bar */
+    #ingest-progress-wrap {
+      display: none;
+      width: 100%;
+      margin-top: 6px;
+    }
+    #ingest-progress-bar-track {
+      width: 100%;
+      height: 6px;
+      background: #2a2a2a;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    #ingest-progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #3b4fd8, #6c7ff0);
+      border-radius: 4px;
+      transition: width 0.4s ease;
+    }
+    #ingest-progress-label {
+      font-size: .72rem;
+      color: #666;
+      margin-top: 3px;
+      text-align: right;
+    }
+
     /* -------------------------------------------------------------- messages */
     #messages {
       flex: 1;
@@ -279,6 +306,10 @@
   <button onclick="clearChat()">🗑 Clear Chat</button>
   <span id="ingest-status"></span>
 </div>
+<div id="ingest-progress-wrap" style="padding: 0 16px 8px;">
+  <div id="ingest-progress-bar-track"><div id="ingest-progress-bar-fill"></div></div>
+  <div id="ingest-progress-label"></div>
+</div>
 
 <!-- =========================================================== MESSAGES -->
 <div id="messages">
@@ -366,32 +397,74 @@
     }
   }
 
+  // ---------------------------------------------------------------- ingest helpers
+  function showProgress(pct, label) {
+    const wrap  = document.getElementById("ingest-progress-wrap");
+    const fill  = document.getElementById("ingest-progress-bar-fill");
+    const lbl   = document.getElementById("ingest-progress-label");
+    wrap.style.display = "block";
+    fill.style.width   = Math.min(pct, 100) + "%";
+    lbl.textContent    = label;
+  }
+  function hideProgress() {
+    document.getElementById("ingest-progress-wrap").style.display = "none";
+    document.getElementById("ingest-progress-bar-fill").style.width = "0%";
+    document.getElementById("ingest-progress-label").textContent = "";
+  }
+
   // ---------------------------------------------------------------- ingest
   async function triggerIngest() {
     const btn    = document.getElementById("ingest-btn");
     const status = document.getElementById("ingest-status");
     const badge  = document.getElementById("status-badge");
     btn.disabled = true;
-    status.textContent = "Indexing documentation…";
+    status.textContent = "⏳ Loading documentation files…";
     badge.className = "not_ready";
     badge.textContent = "↻ Re-indexing Docs…";
+    showProgress(0, "Starting…");
+
+    // Poll progress for docs too
+    let pollTimer = setInterval(async () => {
+      try {
+        const p = await (await fetch("/api/ingest/progress")).json();
+        if (p.stage === "loading" || p.stage === "embedding") {
+          const done  = p.chunks_done  || 0;
+          const total = p.chunks_total || 0;
+          if (total > 0) {
+            const pct = Math.round((done / total) * 100);
+            status.textContent = `⚙️ Embedding chunks… ${done.toLocaleString()} / ${total.toLocaleString()}`;
+            showProgress(pct, `${pct}% complete`);
+          } else {
+            status.textContent = "⏳ Embedding documentation…";
+            showProgress(0, "Processing…");
+          }
+        }
+      } catch (_) {}
+    }, 1000);
+
     try {
       const res  = await fetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reset: true }),
       });
+      clearInterval(pollTimer);
       const data = await res.json();
       if (res.ok) {
         status.textContent =
-          `✓ Docs: ${data.files_loaded} file(s) → ${data.vectors_stored} vectors`;
+          `✓ Docs: ${data.files_loaded} file(s) → ${data.vectors_stored.toLocaleString()} vectors`;
+        showProgress(100, "Complete!");
+        setTimeout(hideProgress, 3000);
         checkStatus();
       } else {
         status.textContent = `✗ ${data.detail}`;
+        hideProgress();
       }
     } catch (e) {
       status.textContent = "✗ Network error";
+      hideProgress();
     } finally {
+      clearInterval(pollTimer);
       btn.disabled = false;
     }
   }
@@ -401,20 +474,29 @@
     const status = document.getElementById("ingest-status");
     const badge  = document.getElementById("status-badge");
     btn.disabled = true;
-    status.textContent = "Fetching Jira issues… 0 fetched";
-    // Reflect the reset immediately — Jira collection is wiped on the server
-    // as soon as the request is processed, so show 0 jira vectors right away.
+    status.textContent = "⏳ Fetching Jira issues… 0 fetched";
     badge.className = "not_ready";
     badge.textContent = "↻ Re-indexing Jira…";
+    showProgress(0, "Fetching tickets…");
 
     // Poll /api/ingest/progress every second for live counts
     let pollTimer = setInterval(async () => {
       try {
         const p = await (await fetch("/api/ingest/progress")).json();
         if (p.stage === "fetching") {
-          status.textContent = `Fetching Jira issues… ${p.fetched.toLocaleString()} fetched`;
+          status.textContent = `⏳ Fetching Jira tickets… ${p.fetched.toLocaleString()} fetched`;
+          showProgress(0, `${p.fetched.toLocaleString()} tickets fetched`);
         } else if (p.stage === "embedding") {
-          status.textContent = `Embedding ${p.fetched.toLocaleString()} issues… (this may take a while)`;
+          const done  = p.chunks_done  || 0;
+          const total = p.chunks_total || 0;
+          if (total > 0) {
+            const pct = Math.round((done / total) * 100);
+            status.textContent = `⚙️ Embedding… ${done.toLocaleString()} / ${total.toLocaleString()} chunks (${p.fetched.toLocaleString()} tickets)`;
+            showProgress(pct, `${pct}% — ${done.toLocaleString()} of ${total.toLocaleString()} chunks embedded`);
+          } else {
+            status.textContent = `⚙️ Preparing ${p.fetched.toLocaleString()} tickets for embedding…`;
+            showProgress(0, "Chunking documents…");
+          }
         }
       } catch (_) {}
     }, 1000);
@@ -429,14 +511,18 @@
       const data = await res.json();
       if (res.ok) {
         status.textContent =
-          `✓ Jira: ${data.issues_fetched.toLocaleString()} issue(s) → ${data.vectors_stored.toLocaleString()} vectors`;
+          `✓ Jira: ${data.issues_fetched.toLocaleString()} ticket(s) → ${data.vectors_stored.toLocaleString()} vectors`;
+        showProgress(100, "Complete!");
+        setTimeout(hideProgress, 3000);
         checkStatus();
       } else {
         status.textContent = `✗ Jira error: ${data.detail}`;
+        hideProgress();
       }
     } catch (e) {
       clearInterval(pollTimer);
       status.textContent = "✗ Network error (check JIRA_* vars in .env)";
+      hideProgress();
     } finally {
       btn.disabled = false;
     }

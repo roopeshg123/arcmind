@@ -123,16 +123,33 @@ class ChromaStore:
         _clear_chroma_cache()
 
     @staticmethod
-    def _add_in_batches(store: Chroma, chunks: list[Document], batch_size: int) -> None:
-        """Upsert *chunks* to ChromaDB in batches to respect API rate limits."""
+    def _add_in_batches(
+        store: Chroma,
+        chunks: list[Document],
+        batch_size: int,
+        on_progress: Any = None,
+    ) -> None:
+        """Upsert *chunks* to ChromaDB in batches to respect API rate limits.
+
+        Args:
+            on_progress: Optional callable(done: int, total: int) called after
+                         each batch so callers can report live progress.
+        """
         total = len(chunks)
+        done  = 0
         for i in range(0, total, batch_size):
             batch = chunks[i: i + batch_size]
             store.add_documents(batch)
+            done += len(batch)
             log.info(
                 "  Embedded batch %d–%d / %d.",
                 i + 1, min(i + batch_size, total), total,
             )
+            if on_progress is not None:
+                try:
+                    on_progress(done, total)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # BM25 index management
@@ -236,26 +253,36 @@ class ChromaStore:
     # Public write API
     # ------------------------------------------------------------------
 
-    def add_docs_batch(self, chunks: list[Document], reset: bool = False) -> int:
+    def add_docs_batch(
+        self,
+        chunks: list[Document],
+        reset: bool = False,
+        on_progress: Any = None,
+    ) -> int:
         """Embed and store documentation chunks.  Returns new collection count."""
         if reset:
             self._reset_collection(DOCS_COLLECTION)
 
         store = self._get_store(DOCS_COLLECTION)
-        self._add_in_batches(store, chunks, EMBED_BATCH_SIZE)
+        self._add_in_batches(store, chunks, EMBED_BATCH_SIZE, on_progress=on_progress)
         count = store._collection.count()
         log.info("Docs collection: %d vectors.", count)
 
         self._build_bm25(DOCS_COLLECTION, new_docs=None if reset else chunks)
         return count
 
-    def add_jira_batch(self, chunks: list[Document], reset: bool = False) -> int:
+    def add_jira_batch(
+        self,
+        chunks: list[Document],
+        reset: bool = False,
+        on_progress: Any = None,
+    ) -> int:
         """Embed and store Jira chunks.  Returns new collection count."""
         if reset:
             self._reset_collection(JIRA_COLLECTION)
 
         store = self._get_store(JIRA_COLLECTION)
-        self._add_in_batches(store, chunks, EMBED_BATCH_SIZE)
+        self._add_in_batches(store, chunks, EMBED_BATCH_SIZE, on_progress=on_progress)
         count = store._collection.count()
         log.info("Jira collection: %d vectors.", count)
 

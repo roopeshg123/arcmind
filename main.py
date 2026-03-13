@@ -176,7 +176,10 @@ async def status():
 # ---------------------------------------------------------------------------
 
 _ingestion_lock: asyncio.Lock = asyncio.Lock()  # prevents concurrent ingest runs
-_ingest_progress: dict = {"stage": "idle", "fetched": 0, "total": 0, "vectors": 0}
+_ingest_progress: dict = {
+    "stage": "idle", "fetched": 0, "total": 0,
+    "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+}
 
 
 @app.get("/api/ingest/progress")
@@ -205,7 +208,10 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
 
     result = None
     async with _ingestion_lock:
-        _ingest_progress = {"stage": "loading", "fetched": 0, "total": 0, "vectors": 0}
+        _ingest_progress = {
+            "stage": "loading", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
         rag_engine.reset_chain()
         try:
             result = await asyncio.get_event_loop().run_in_executor(
@@ -233,7 +239,10 @@ async def ingest_jira(request: JiraIngestRequest):
 
     result = None
     async with _ingestion_lock:
-        _ingest_progress = {"stage": "fetching", "fetched": 0, "total": 0, "vectors": 0}
+        _ingest_progress = {
+            "stage": "fetching", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
         try:
             result = await ingest_jira_async(
                 jql=request.jql,

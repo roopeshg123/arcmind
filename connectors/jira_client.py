@@ -75,11 +75,13 @@ def _format_issue(issue: dict) -> dict:
 
     # Comments — cap at 20 per ticket to avoid huge chunks
     comment_list: list[str] = []
+    comment_items: list[dict] = []  # structured list for per-comment indexing
     for c in (fields.get("comment") or {}).get("comments", [])[:20]:
         author = (c.get("author") or {}).get("displayName", "Unknown")
         body = _extract_text(c.get("body")).strip()
         if body:
             comment_list.append(f"[{author}]: {body}")
+            comment_items.append({"author": author, "body": body})
 
     components = [comp.get("name", "") for comp in fields.get("components") or []]
     labels = fields.get("labels") or []
@@ -104,6 +106,7 @@ def _format_issue(issue: dict) -> dict:
         "summary":      fields.get("summary", ""),
         "description":  description,
         "comments":     "\n".join(comment_list),
+        "comment_items": comment_items,
         "labels":       labels,
         "components":   components,
         "status":       (fields.get("status") or {}).get("name", ""),

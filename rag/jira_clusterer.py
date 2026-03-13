@@ -110,7 +110,9 @@ def format_jira_clusters(clusters: dict[str, list[Document]]) -> str:
     """
     Render *clusters* as a Markdown-formatted string for LLM context.
 
-    Each cluster becomes a heading with bullet-point ticket summaries.
+    Each cluster becomes a heading. Main ticket documents are rendered as a
+    bullet summary line. Comment documents are rendered with their full body
+    so the LLM can read discussion details (e.g. API key mentions, decisions).
     """
     if not clusters:
         return "No relevant Jira issues found."
@@ -119,21 +121,27 @@ def format_jira_clusters(clusters: dict[str, list[Document]]) -> str:
     for topic, docs in sorted(clusters.items()):
         lines.append(f"### {topic}")
         for doc in docs:
-            ticket  = doc.metadata.get("ticket", "Unknown")
-            status  = doc.metadata.get("status", "")
-            # Use stored summary metadata first; fall back to content parsing
-            summary = doc.metadata.get("summary", "")
-            if not summary:
-                skip_keys = {"Ticket:", "Type:", "Status:", "Priority:",
-                             "Resolution:", "Components:", "Labels:", "Summary:",
-                             "Description:", "Comments:"}
-                for line in doc.page_content.splitlines():
-                    stripped = line.strip()
-                    if stripped and not any(stripped.startswith(k) for k in skip_keys):
-                        summary = stripped[:120]
-                        break
+            ticket     = doc.metadata.get("ticket", "Unknown")
+            status     = doc.metadata.get("status", "")
+            doc_type   = doc.metadata.get("type", "")
             status_tag = f" [{status}]" if status else ""
-            lines.append(f"- **{ticket}**{status_tag}: {summary[:120]}")
+
+            if doc_type == "comment":
+                # Include full comment content so the LLM can read it
+                lines.append(f"- **{ticket}**{status_tag} (comment):\n{doc.page_content.strip()}")
+            else:
+                # Use stored summary metadata first; fall back to content parsing
+                summary = doc.metadata.get("summary", "")
+                if not summary:
+                    skip_keys = {"Ticket:", "Type:", "Status:", "Priority:",
+                                 "Resolution:", "Components:", "Labels:", "Summary:",
+                                 "Description:", "Comments:"}
+                    for line in doc.page_content.splitlines():
+                        stripped = line.strip()
+                        if stripped and not any(stripped.startswith(k) for k in skip_keys):
+                            summary = stripped[:120]
+                            break
+                lines.append(f"- **{ticket}**{status_tag}: {summary[:120]}")
         lines.append("")   # blank line between clusters
 
     return "\n".join(lines).strip()
