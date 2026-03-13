@@ -19,7 +19,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -189,7 +189,7 @@ async def ingest_progress():
 
 
 @app.post("/api/ingest")
-async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
+async def ingest(request: IngestRequest):
     """Ingest Arc documentation from disk or DOCS_URL."""
     global _ingest_progress
     if _ingestion_lock.locked():
@@ -214,7 +214,7 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
         }
         rag_engine.reset_chain()
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 functools.partial(run_ingestion, docs_dir=docs_dir, reset=request.reset),
             )
@@ -291,7 +291,7 @@ async def chat(request: ChatRequest):
     history = [{"role": m.role, "content": m.content} for m in (request.history or [])]
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None,
             functools.partial(
                 rag_engine.ask,
