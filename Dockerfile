@@ -33,9 +33,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source
+# Copy application source — flat shims kept for compatibility
 COPY main.py rag_engine.py ingest.py ./
-COPY static/ ./static/
+# New package tree
+COPY connectors/ ./connectors/
+COPY ingest/     ./ingest/
+COPY rag/        ./rag/
+COPY vector_db/  ./vector_db/
+COPY static/     ./static/
 
 # docs/ and chroma_db/ are intentionally NOT baked into the image —
 # they are mounted as volumes at runtime so data persists across deploys.

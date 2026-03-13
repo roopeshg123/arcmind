@@ -1,21 +1,33 @@
-# ArcMind — AI Chat Assistant for Arc Documentation
+# ArcMind — Enterprise AI Assistant for Arc
 
-Chat with your Arc application documentation using OpenAI GPT and a local vector search engine.
-Ask questions in plain English and get accurate, sourced answers instantly.
+Chat with your Arc documentation **and** Jira ticket history using OpenAI GPT and a local hybrid search engine.
+Ask questions in plain English and get accurate, sourced answers instantly — from both your docs and your real support/bug history.
 
 ---
 
 ## What's Inside
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `main.py` | FastAPI web server — all API routes |
-| `rag_engine.py` | RAG logic — retrieval chain + LLM |
-| `ingest.py` | Ingestion pipeline — reads docs, builds vector store |
-| `static/index.html` | Chat UI served by the backend |
-| `.env` | Your config & secrets (never commit with real values) |
-| `Dockerfile` | Container image definition |
-| `docker-compose.yml` | Run the app with one command |
+| `main.py` | FastAPI web server — all API routes, API-key auth middleware, CORS |
+| `rag_engine.py` | Top-level RAG pipeline — orchestrates retrieval, reranking, and answer generation |
+| `connectors/jira_client.py` | Jira REST API v3 client with cursor pagination |
+| `ingest/ingest_docs.py` | HTML doc ingestion — web crawl or local folder, with `MAX_CRAWL_PAGES` cap |
+| `ingest/ingest_jira.py` | Jira issue ingestion pipeline (full + incremental sync) |
+| `ingest/chunking.py` | Token-aware text splitter (1500 tokens / 300 overlap) |
+| `rag/retriever.py` | Hybrid BM25 + vector search with cross-encoder reranker |
+| `rag/query_expander.py` | LLM-driven query expansion — generates 5 query variants |
+| `rag/jira_clusterer.py` | Groups related Jira tickets for cleaner, deduplicated answers |
+| `rag/prompt_builder.py` | Builds the final GPT prompt with doc + Jira context |
+| `rag/conversation_memory.py` | Per-session conversation history manager |
+| `rag/connector_detector.py` | Detects Arc connector/component references in queries |
+| `rag/query_router.py` | Routes queries to docs-only, Jira-only, or hybrid retrieval |
+| `rag/reranker.py` | Cross-encoder reranker wrapper (`ms-marco-MiniLM-L-6-v2`) |
+| `vector_db/chroma_store.py` | ChromaDB + BM25 store — two collections, BM25 append-mode incremental sync |
+| `static/index.html` | Chat UI — live progress bar for both doc and Jira indexing |
+| `.env` | Local config — **never commit** (contains your API keys) |
+| `Dockerfile` | Two-stage container build (builder + lean runtime, reranker pre-downloaded) |
+| `docker-compose.yml` | Run the full app with one command |
 | `chroma_db/` | Vector store — auto-created after first indexing |
 
 ---
@@ -27,24 +39,25 @@ Ask questions in plain English and get accurate, sourced answers instantly.
 | **Python 3.12** | Backend language |
 | **FastAPI** | REST API framework |
 | **Uvicorn** | ASGI server |
-| **LangChain** | RAG orchestration (chains, prompts, retrievers) |
-| **ChromaDB** | Local vector database (saved to disk, no cloud needed) |
+| **LangChain** | Document splitting, prompt chains, LLM integration |
+| **ChromaDB** | Local vector database (two collections: docs + jira) |
 | **OpenAI API** | Embeddings (`text-embedding-3-large`) + Chat (`gpt-4.1`) |
-| **BeautifulSoup4** | HTML parsing and text extraction |
-| **sentence-transformers** | Cross-encoder reranker for better search accuracy |
-| **requests** | HTTP client for web crawling docs |
+| **rank-bm25** | BM25 keyword search (hybrid retrieval alongside vectors) |
+| **sentence-transformers** | Cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`) |
+| **BeautifulSoup4 / lxml** | HTML parsing and text extraction |
+| **requests** | HTTP client for web crawling and Jira API |
+| **tiktoken** | Token counting for chunking |
 | **Docker / Podman** | Container runtime for easy team deployment |
 
 ---
 
 ## Prerequisites
 
-Before setting up, you need:
-
-- **Python 3.12** — [python.org/downloads](https://www.python.org/downloads/) (3.13+ not supported)
+- **Python 3.12** — [python.org/downloads](https://www.python.org/downloads/)
 - **Git** — [git-scm.com](https://git-scm.com)
 - **OpenAI API Key** — [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (billing must be enabled)
-- **Your docs folder** — the folder containing your `.html` documentation files
+- **Your docs folder** — folder containing your `.html` documentation files
+- *(Optional)* **Jira API token** — from [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
 
 ---
 
@@ -72,149 +85,91 @@ pip install -r requirements.txt
 
 ### Step 4 — Configure your `.env` file
 
-The `.env` file is already in the repo with placeholder values. Open it and fill in your values:
+The `.env` file is already in the repo with placeholder values. Just open it and fill in your real values:
 
 ```powershell
 notepad .env
 ```
 
-At minimum, set:
+Minimum required:
 
 ```env
 OPENAI_API_KEY=sk-proj-...your-key-here...
 DOCS_DIR=C:\path\to\your\html\docs
 ```
 
-Full `.env` reference:
+To also enable Jira:
 
 ```env
-# --- Required ---
-OPENAI_API_KEY=sk-proj-...
-
-# --- Models ---
-CHAT_MODEL=gpt-4.1
-EMBEDDING_MODEL=text-embedding-3-large
-
-# --- Ingestion ---
-# Use DOCS_DIR for a local folder of HTML files:
-DOCS_DIR=C:\path\to\your\html\docs
-# Use DOCS_URL instead to crawl a website (comment out DOCS_DIR):
-# DOCS_URL=http://localhost:8081/
-
-# --- Chunking ---
-CHUNK_SIZE=1500
-CHUNK_OVERLAP=300
-
-# --- Retrieval ---
-RETRIEVER_TOP_K=15
-RERANKER_ENABLED=true
-RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
-RERANKER_TOP_N=8
-
-# --- Storage ---
-CHROMA_DB_DIR=./chroma_db
+JIRA_BASE_URL=https://your-org.atlassian.net
+JIRA_EMAIL=you@yourcompany.com
+JIRA_API_TOKEN=your-jira-api-token
+JIRA_PROJECT_KEY=ARC
 ```
 
 ### Step 5 — Start the app
 
 ```powershell
-python main.py
-or
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Then open [http://localhost:8000](http://localhost:8000) in your browser.
+Open [http://localhost:8000](http://localhost:8000).
 
-### Step 6 — Index your docs
+### Step 6 — Index your content
 
-Click the **Index Docs** button in the UI (or call `POST /api/ingest`).  
-This reads your docs, splits them into chunks, generates embeddings, and saves the vector store to `chroma_db/`.  
-**Re-index any time your docs change.**
+1. Click **⚡ Index Docs** to index your HTML documentation.
+2. *(Optional)* Click **🔗 Index Jira** to index your Jira project.
+
+The status badge shows live progress and final counts:
+`✓ Ready — 20,479 vectors (docs: 2809, jira: 17670)`
 
 ---
 
 ## Option B — Docker / Podman Setup
 
-This is the easiest way to share the app with your team — no Python installation needed on their machines.
+No Python installation needed on team machines.
 
 ### Step 1 — Install Docker or Podman
 
 - **Docker Desktop**: [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop)
-- **Podman Desktop** (free): [podman-desktop.io](https://podman-desktop.io) — use `podman` in place of `docker` everywhere
+- **Podman Desktop** (free): [podman-desktop.io](https://podman-desktop.io)
 
-### Step 2 — Clone the repo
+### Step 2 — Clone and configure
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/arcmind.git
 cd arcmind
+notepad .env
 ```
 
-### Step 3 — Configure your `.env` file
-
-The `.env` file is already in the repo. Open it and fill in your values:
-
-```powershell
-notepad .env    # Windows
-nano .env       # Linux / macOS
-```
-
-Fill in your values. At minimum set `OPENAI_API_KEY` and your docs source — choose one of the two options below:
-
-**Option 1 — Local folder** (simplest, works on Windows):
-
-```env
-OPENAI_API_KEY=sk-proj-...your-key-here...
-DOCS_DIR=C:\path\to\your\html\docs
-```
-
-Docker Compose reads `DOCS_DIR` from your `.env` and automatically mounts that Windows folder into the container. Nothing else needed.
-
-**Option 2 — Web URL** (if the docs are hosted on a server or you prefer HTTP):
-
-```env
-OPENAI_API_KEY=sk-proj-...your-key-here...
-DOCS_URL=http://host.docker.internal:8081/
-```
-
-To serve a local docs folder over HTTP so the container can reach it:
-
-```powershell
-python -m http.server 8081 --directory "C:\path\to\your\html\docs"
-```
-
-### Step 4 — Build and run
+### Step 3 — Build and run
 
 ```bash
 docker compose up --build
 ```
 
-The app starts at [http://localhost:8000](http://localhost:8000).
+App starts at [http://localhost:8000](http://localhost:8000).
 
-To run in the background:
+Run in background: `docker compose up --build -d`
 
-```bash
-docker compose up --build -d
-```
+Stop: `docker compose down`
 
-To stop:
-
-```bash
-docker compose down
-```
-
-### Step 5 — Index your docs
-
-Click **Index Docs** in the UI. The vector store is saved in a named Docker volume (`chroma_data`) so it survives container restarts.
-
-### Useful commands
+### Useful Docker commands
 
 | Task | Command |
 |---|---|
-| View logs | `docker compose logs -f` |
+| View live logs | `docker compose logs -f` |
 | Restart app | `docker compose restart` |
 | Stop and remove containers | `docker compose down` |
-| Wipe vector store and start fresh | `docker compose down -v` |
+| Wipe vector store (re-index from scratch) | `docker compose down -v` |
 | Rebuild after code changes | `docker compose up --build` |
+
+### Volumes
+
+| Volume | Contents |
+|---|---|
+| `chroma_data` | ChromaDB vector store + BM25 index pickles — persists across restarts |
+| `logs_data` | Query logs |
 
 ---
 
@@ -223,15 +178,20 @@ Click **Index Docs** in the UI. The vector store is saved in a named Docker volu
 | Endpoint | Method | Description |
 |---|---|---|
 | `/` | GET | Serves the chat UI |
-| `/api/status` | GET | Returns vector store health and document count |
-| `/api/ingest` | POST | Triggers document ingestion / re-indexing |
-| `/api/chat` | POST | Sends a question, returns an answer with sources |
+| `/api/status` | GET | Returns vector counts (`docs_vectors`, `jira_vectors`, `total_vectors`) |
+| `/api/ingest` | POST | Index / re-index HTML documentation |
+| `/api/ingest/jira` | POST | Full index / re-index of Jira project |
+| `/api/ingest/jira/sync` | POST | Incremental sync — fetches only issues updated in the last N hours |
+| `/api/ingest/progress` | GET | Live progress (chunks done / total) during doc or Jira indexing |
+| `/api/chat` | POST | Ask a question, get a full answer with sources (blocking) |
+| `/api/chat/stream` | POST | Ask a question, get a streaming answer via Server-Sent Events (SSE) |
 
-### `/api/chat` request body
+### `/api/chat` request
 
 ```json
 {
-  "question": "How do I configure SFTP in Arc MFT?"
+  "question": "How do I configure SFTP in Arc MFT?",
+  "history": []
 }
 ```
 
@@ -250,47 +210,49 @@ Click **Index Docs** in the UI. The vector store is saved in a named Docker volu
 
 ## How It Works
 
-1. **Ingestion** — `ingest.py` reads your HTML docs (local folder or web crawl), strips tags, splits text into overlapping chunks, and generates vector embeddings via the OpenAI API. Embeddings are stored in ChromaDB on disk.
+### Indexing
 
-2. **Retrieval** — When you ask a question, `rag_engine.py` converts it to an embedding and does a Maximum Marginal Relevance (MMR) search to fetch the 15 most relevant chunks while avoiding redundancy.
+**Docs** — HTML files are parsed by BeautifulSoup, split into 1500-token chunks with 300-token overlap, embedded with `text-embedding-3-large`, and stored in the `arcmind_docs` ChromaDB collection. A companion BM25 index is pickled alongside. A `MAX_CRAWL_PAGES` cap prevents unbounded web crawls. Live progress is streamed via `/api/ingest/progress` and shown in the UI progress bar.
 
-3. **Reranking** — A cross-encoder model (`ms-marco-MiniLM-L-6-v2`) rescores the retrieved chunks for precision, keeping the top 8.
+**Jira** — All issues are fetched via Jira REST API v3 with cursor-based pagination (so all tickets are retrieved regardless of project size). Each issue is formatted as structured text (key, summary, type, status, priority, description, comments, fix versions, sprint) then chunked and embedded into the `arcmind_jira` collection. The BM25 index uses **append mode** during incremental syncs to avoid a full rebuild. Use `/api/ingest/jira/sync` for fast incremental updates.
 
-4. **Generation** — The top chunks are injected into a prompt and sent to `gpt-4.1`, which synthesises a grounded answer with source references.
+### Querying
+
+1. **Connector detection** — `connector_detector.py` identifies any Arc connector or component name in the query for targeted Jira filtering.
+2. **Query routing** — `query_router.py` decides whether to search docs-only, Jira-only, or both collections.
+3. **Query expansion** — The question is rewritten into 5 variants covering synonyms, acronym expansions, and related sub-topics.
+4. **Hybrid retrieval** — Each variant is searched across both ChromaDB (semantic) and BM25 (keyword). Results are merged and deduplicated.
+5. **Reranking** — A local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores all candidates against the original question. Top `RERANKER_TOP_N` chunks are kept.
+6. **Answer generation** — Top doc chunks and a clustered Jira summary are injected into a strict prompt and sent to `gpt-4.1`. Streaming is available via `/api/chat/stream`.
 
 ---
 
-## Configuration Quick Reference
-
-> Re-index (`POST /api/ingest`) after changing any of these.
+## Configuration Reference
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CHAT_MODEL` | `gpt-4.1` | OpenAI model used for answers |
-| `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model (changing this requires full re-index) |
-| `CHUNK_SIZE` | `1500` | Tokens per chunk — larger = more context per chunk |
-| `CHUNK_OVERLAP` | `300` | Token overlap between chunks — helps preserve continuity |
-| `RETRIEVER_TOP_K` | `15` | Chunks fetched before reranking |
-| `RERANKER_ENABLED` | `true` | Toggle cross-encoder reranker on/off |
-| `RERANKER_TOP_N` | `8` | Chunks passed to GPT after reranking |
-
----
-
-## Pushing to GitHub
-
-```powershell
-git init                          # if not already a git repo
-git add .
-git commit -m "initial commit"
-git remote add origin https://github.com/YOUR_USERNAME/arcmind.git
-git push -u origin main
-```
-
-> `.env` is committed with **placeholder values only** — never replace the placeholder with your real API key before pushing. Each person sets their own real key locally after cloning.
+| `OPENAI_API_KEY` | *(required)* | Your OpenAI secret key |
+| `API_KEY` | *(unset)* | When set, all `/api/*` requests must include `X-API-Key: <value>`. Leave unset in dev. |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins. Restrict in production (e.g. `https://yoursite.com`). |
+| `CHAT_MODEL` | `gpt-4.1` | OpenAI model for answers |
+| `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model |
+| `CHUNK_SIZE` | `1500` | Tokens per chunk |
+| `CHUNK_OVERLAP` | `300` | Token overlap between chunks |
+| `RETRIEVER_TOP_K` | `15` | Candidates fetched from each collection before reranking |
+| `DOCS_TOP_K` | `8` | Doc chunks passed to GPT after reranking |
+| `JIRA_TOP_K` | `6` | Jira chunks passed to GPT after reranking |
+| `RERANKER_ENABLED` | `true` | Toggle cross-encoder reranker |
+| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
+| `RERANKER_TOP_N` | `8` | Total chunks passed to GPT after reranking |
+| `MAX_CRAWL_PAGES` | `2000` | Max pages fetched during a web crawl |
+| `CHROMA_DB_DIR` | `./chroma_db` | Vector store and BM25 pickle location |
+| `JIRA_URL` | — | Atlassian Cloud URL (e.g. `https://your-org.atlassian.net`) |
+| `JIRA_EMAIL` | — | Login email for Jira API auth |
+| `JIRA_API_TOKEN` | — | API token from Atlassian account settings |
+| `JIRA_PROJECT_KEY` | — | Jira project key to index (e.g. `ARCESB`) |
 
 ---
 
 ## License
 
 MIT
-

@@ -243,44 +243,69 @@ QUERY PHASE (runs every time you ask a question):
     │   connector in Arc?"                    │
     └─────────────────────────────────────────┘
 
-  Step 2: EMBED THE QUESTION (OpenAI Embeddings API)
+  Step 2: CONNECTOR DETECTION + QUERY ROUTING
     ┌─────────────────────────────────────────┐
-    │  The rewritten question is embedded     │
-    │  into a 1536-number vector              │
+    │  connector_detector.py scans the query  │
+    │  for known Arc connector / component    │
+    │  names (SFTP, REST, Jira, etc.)         │
+    │                                         │
+    │  query_router.py decides:               │
+    │   - docs-only (how-to questions)        │
+    │   - jira-only (bug/ticket questions)    │
+    │   - hybrid  (default for most queries)  │
     └─────────────────────────────────────────┘
 
-  Step 3: RETRIEVE (ChromaDB MMR search)
+  Step 3: QUERY EXPANSION
     ┌─────────────────────────────────────────┐
-    │  Question vector compared to all 6240   │
-    │  stored vectors using cosine similarity │
-    │                                         │
-    │  MMR (Maximal Marginal Relevance)       │
-    │  returns top 5 most relevant AND        │
-    │  diverse chunks                         │
-    │                                         │
-    │  Returns: 5 text chunks + source files  │
+    │  query_expander.py sends the query to   │
+    │  gpt-4.1 (singleton, cached)            │
+    │  Generates 5 variants covering:         │
+    │   - synonyms                            │
+    │   - acronym expansions                  │
+    │     (e.g. "MDN" → "Message Disposition  │
+    │      Notification")                     │
+    │   - related sub-topics                  │
     └─────────────────────────────────────────┘
 
-  Step 4: GENERATE (OpenAI Chat Completions API)
+  Step 4: HYBRID RETRIEVAL
     ┌─────────────────────────────────────────┐
-    │  Prompt sent to GPT-4o-mini:            │
+    │  Each of the 5 variants is searched:    │
+    │   a) ChromaDB vector search (semantic)  │
+    │   b) BM25 keyword search (exact terms)  │
+    │  Across the relevant collection(s).     │
+    │  Results merged + deduplicated.         │
+    │  Top RETRIEVER_TOP_K candidates kept.   │
+    └─────────────────────────────────────────┘
+
+  Step 5: RERANKING (cross-encoder, local)
+    ┌─────────────────────────────────────────┐
+    │  reranker.py scores each (query, chunk) │
+    │  pair jointly using the cross-encoder.  │
+    │  Far more accurate than cosine sim.     │
+    │  Runs entirely on-device (~22MB model). │
+    │  Top RERANKER_TOP_N chunks kept.        │
+    └─────────────────────────────────────────┘
+
+  Step 6: GENERATE (OpenAI Chat Completions API)
+    ┌─────────────────────────────────────────┐
+    │  Prompt sent to gpt-4.1:                │
     │                                         │
     │  SYSTEM: "You are a helpful assistant.  │
-    │  Answer using ONLY this documentation: │
+    │  Answer using ONLY this documentation:  │
     │   [chunk 1 from REST.html]              │
     │   [chunk 2 from REST.html]              │
     │   [chunk 3 from Webhook.html]           │
-    │   [chunk 4 from Script.html]            │
-    │   [chunk 5 from REST.html]"             │
+    │   [Jira cluster: ARC-1234, ARC-5678]"  │
     │                                         │
     │  HISTORY: [previous messages]           │
     │  USER:    "How do I authenticate it?"   │
     │                                         │
     │  GPT reads the chunks and writes        │
-    │  a grounded, accurate answer            │
+    │  a grounded, accurate answer.           │
+    │  Streaming available via /api/chat/stream│
     └─────────────────────────────────────────┘
 
-  Step 5: RETURN
+  Step 7: RETURN
     ┌─────────────────────────────────────────┐
     │  Answer text sent back to browser       │
     │  Source files listed below the answer   │
@@ -291,46 +316,93 @@ QUERY PHASE (runs every time you ask a question):
  PART 4 — PROJECT FILE STRUCTURE & WHAT EACH FILE DOES
 ════════════════════════════════════════════════════════════════════════════════
 
-  D:\application-docs-rag\
+  D:\arcmind\
   │
-  ├── .env                    ← Secret configuration file
-  │                             OPENAI_API_KEY, model names, paths
-  │                             NEVER commit this to Git
+  ├── .env                    ← Local config — NEVER commit (contains real API keys)
+  │                             OPENAI_API_KEY, API_KEY, CORS_ORIGINS,
+  │                             JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN,
+  │                             JIRA_PROJECT_KEY, model names, paths
+  ├── requirements.txt        ← pip install -r requirements.txt
   │
-  ├── requirements.txt        ← List of Python packages to install
-  │                             pip install -r requirements.txt reads this
+  ├── main.py                 ← FastAPI web server (v2.0.0)
+  │                             API routes + asyncio.Lock (race condition safe)
+  │                             API-key auth middleware (X-API-Key header)
+  │                             CORS via CORS_ORIGINS env var
+  │                             Session-id validation (max 128 chars)
+  │                             Routes: /api/chat, /api/chat/stream,
+  │                             /api/ingest, /api/ingest/jira,
+  │                             /api/ingest/jira/sync, /api/ingest/progress,
+  │                             /api/status
   │
-  ├── main.py                 ← FastAPI web server
-  │                             Defines all API routes (/api/chat, /api/ingest)
-  │                             Entry point: uvicorn main:app
+  ├── rag_engine.py           ← Top-level RAG pipeline
+  │                             ChatOpenAI singleton caching (_get_llm)
+  │                             Async-safe: wraps pipeline in run_in_executor
+  │                             Configurable top-k via DOCS_TOP_K/JIRA_TOP_K
+  │                             reset_chain() clears LLM + chain singletons
   │
-  ├── rag_engine.py           ← Core RAG logic
-  │                             Builds the LangChain retrieval chain
-  │                             Connects ChromaDB retriever + OpenAI LLM
-  │                             Manages conversation history
+  ├── connectors/
+  │   └── jira_client.py      ← Jira REST API v3 client
+  │                             Cursor-based pagination (nextPageToken)
+  │                             Fetches: summary, description, comments,
+  │                             status, type, priority, labels, components,
+  │                             fix versions, sprint, created, updated
   │
-  ├── ingest.py               ← Document ingestion pipeline
-  │                             Two modes:
-  │                             1. Web crawl: fetches pages from DOCS_URL
-  │                             2. Local files: reads from DOCS_DIR
-  │                             Both: strips noise → splits → embeds → stores
+  ├── ingest/
+  │   ├── __init__.py         ← Re-exports run_ingestion, run_jira_ingestion
+  │   ├── ingest_docs.py      ← HTML doc ingestion pipeline
+  │   │                         Web crawl (DOCS_URL) or local folder (DOCS_DIR)
+  │   │                         deque.popleft() O(1) crawl queue
+  │   │                         MAX_CRAWL_PAGES cap (prevents unbounded crawls)
+  │   │                         Progress reported to _ingest_progress during embed
+  │   │                         BeautifulSoup strips noise → chunk → embed → store
+  │   ├── ingest_jira.py      ← Jira ingestion pipeline (full + incremental sync)
+  │   │                         ingest_jira_async() — full re-index
+  │   │                         incremental_jira_sync_async() — last N hours only
+  │   │                         BM25 append mode on sync (no full rebuild)
+  │   └── chunking.py         ← Token-aware RecursiveCharacterTextSplitter
+  │                             1500 tokens / 300 token overlap
+  │
+  ├── rag/
+  │   ├── __init__.py
+  │   ├── retriever.py        ← Hybrid BM25 + vector search with reranker
+  │   │                         Searches both arcmind_docs and arcmind_jira
+  │   │                         Jira filtered by connector/component if detected
+  │   ├── query_expander.py   ← LLM-driven query expansion
+  │   │                         ChatOpenAI singleton (_get_expansion_llm)
+  │   │                         Generates 5 query variants for broader recall
+  │   ├── query_router.py     ← Routes to docs-only, Jira-only, or hybrid
+  │   ├── connector_detector.py ← Detects Arc connector/component in queries
+  │   │                           Enables targeted Jira collection filtering
+  │   ├── jira_clusterer.py   ← Groups Jira results into readable ticket summaries
+  │   ├── reranker.py         ← Cross-encoder reranker wrapper
+  │   │                         ms-marco-MiniLM-L-6-v2 (cached locally, ~22MB)
+  │   ├── prompt_builder.py   ← Assembles final GPT prompt with doc + jira context
+  │   └── conversation_memory.py ← Conversation history (in-memory, per session)
+  │
+  ├── vector_db/
+  │   ├── __init__.py
+  │   └── chroma_store.py     ← Manages two ChromaDB collections:
+  │                             arcmind_docs  — documentation chunks
+  │                             arcmind_jira  — Jira ticket chunks
+  │                             Plus companion BM25 Okapi pickle per collection
+  │                             _safe_pickle_load path-validation (security)
+  │                             BM25 append mode for incremental Jira syncs
   │
   ├── static/
-  │   └── index.html          ← The entire chat user interface
-  │                             Pure HTML + CSS + JavaScript (no frameworks)
-  │                             Communicates with FastAPI via fetch() calls
+  │   └── index.html          ← Full chat UI (HTML + CSS + JS, no frameworks)
+  │                             Live progress bar for BOTH docs and Jira indexing
+  │                             Polls /api/ingest/progress during any ingestion
+  │                             Status badge: docs: X, jira: Y vectors
+  │                             Streaming chat via /api/chat/stream (SSE)
   │
-  ├── chroma_db/              ← Auto-created after first ingestion
-  │                             Local vector database (SQLite file)
-  │                             Contains all 4179 embedded document chunks
-  │                             Delete this folder to re-index from scratch
+  ├── chroma_db/              ← Auto-created after first indexing
+  │                             SQLite + BM25 pickles (bm25_docs.pkl, bm25_jira.pkl)
+  │                             Persisted as Docker volume chroma_data
   │
-  ├── docs/                   ← (Optional) local docs folder
-  │                             Not used — DOCS_URL in .env points to
-  │                             https://cdn.cdata.com/help/AZN/mft/
-  │                             Set DOCS_URL= and DOCS_DIR=./docs to use local
-  │
-  ├── README.md               ← Setup guide and documentation
+  ├── Dockerfile              ← Two-stage build (builder + lean runtime)
+  │                             Pre-downloads reranker model at build time
+  ├── docker-compose.yml      ← Run with: docker compose up --build
+  ├── README.md               ← Setup guide
   └── PROJECT_ARCHITECTURE.txt ← This file
 
 
@@ -417,10 +489,28 @@ QUERY PHASE (runs every time you ask a question):
 │                       │ far more accurate relevance scoring than            │
 │                       │ embedding similarity alone (~22MB, cached locally). │
 ├───────────────────────┼──────────────────────────────────────────────────────┤
+│ rank-bm25             │ BM25 keyword search algorithm (Okapi BM25).         │
+│                       │ Why: Vector search is great for semantic meaning    │
+│                       │ but misses exact keyword matches (e.g. a ticket     │
+│                       │ number like "ARC-1234" or a rare product name).     │
+│                       │ BM25 excels at exact term frequency matching.       │
+│                       │ Combining both (hybrid search) gives best recall.   │
+│                       │ The BM25 index is pickled to chroma_db/ so it       │
+│                       │ persists alongside the ChromaDB vector store.       │
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ Jira REST API v3      │ Atlassian hosted API for fetching Jira issues.      │
+│                       │ Why: Support tickets and bug reports often contain  │
+│                       │ the most up-to-date operational knowledge that is   │
+│                       │ NOT in documentation yet. Indexing Jira lets the    │
+│                       │ AI answer "has this bug been reported?" or "how     │
+│                       │ did others configure X?" questions from real data.  │
+│                       │ Uses cursor pagination (nextPageToken) to fetch     │
+│                       │ ALL issues regardless of project size.              │
+├───────────────────────┼──────────────────────────────────────────────────────┤
 │ requests              │ Standard Python HTTP client library.                │
-│                       │ Why: Used by the web crawler in ingest.py to fetch  │
-│                       │ HTML pages from DOCS_URL. Handles timeouts,         │
-│                       │ redirects, and Content-Type checking.               │
+│                       │ Why: Used by the web crawler (ingest_docs.py) and   │
+│                       │ the Jira client (jira_client.py). Handles timeouts, │
+│                       │ redirects, auth, and Content-Type checking.         │
 ├───────────────────────┼──────────────────────────────────────────────────────┤
 │ Docker / Podman       │ Container runtime for packaging and deploying the   │
 │                       │ application. Dockerfile defines the image build.    │
@@ -440,63 +530,88 @@ QUERY PHASE (runs every time you ask a question):
   ║   ┌──────────────────────────────────────────────────────────────────┐   ║
   ║   │                  static/index.html (Chat UI)                     │   ║
   ║   │                                                                  │   ║
-  ║   │   [⚡ Index Docs]   [🗑 Clear Chat]   ✓ Ready — 6240 vectors     │   ║
+  ║   │  [⚡ Index Docs] [🔗 Index Jira]  ✓ Ready — 20,479 vectors      │   ║
+  ║   │                  (docs: 2809, jira: 17670)                       │   ║
   ║   │  ─────────────────────────────────────────────────────────────   │   ║
   ║   │   AI: To configure SFTP, navigate to the connector settings...   │   ║
-  ║   │       📄 Sources: SFTP.html, SFTP-Server.html                   │   ║
+  ║   │       📄 Sources: SFTP.html  •  ARC-1234, ARC-5678              │   ║
   ║   │  ─────────────────────────────────────────────────────────────   │   ║
   ║   │   [Type your question here...                          ] [Send]  │   ║
-  ║   └─────────────────────┬────────────────────┬────────────────────  ┘   ║
-  ╚═════════════════════════│════════════════════│═══════════════════════════╝
-                            │ POST /api/chat      │ POST /api/ingest
-                            │ {question,history}  │ {docs_dir, reset}
-                            ▼                     ▼
+  ║   └──────────┬──────────────────┬──────────────────────────────────  ┘   ║
+  ╚══════════════│══════════════════│═══════════════════════════════════════╝
+                 │ POST /api/chat   │ POST /api/ingest  POST /api/ingest/jira
+                 │ {question,       │ {reset:true}      {reset:true}
+                 │  history}        │
+                 ▼                  ▼
   ╔══════════════════════════════════════════════════════════════════════════╗
   ║                     FASTAPI BACKEND  (main.py)                          ║
   ║                                                                          ║
-  ║   GET  /              →  serves static/index.html                       ║
-  ║   GET  /api/status    →  checks if chroma_db/ exists and has vectors    ║
-  ║   POST /api/ingest    →  calls ingest.py → run_ingestion()              ║
-  ║   POST /api/chat      →  calls rag_engine.py → ask()                    ║
-  ╚══════════════╤═══════════════════════════════════╤═════════════════════╝
-                 │                                   │
-                 ▼                                   ▼
-  ╔═════════════════════════╗         ╔════════════════════════════════════╗
-  ║    ingest.py            ║         ║    rag_engine.py                   ║
-  ║                         ║         ║                                    ║
-  ║  if DOCS_URL set:       ║         ║  1. load_vector_store()            ║
-  ║  1. crawl_site()        ║         ║     ChromaDB.load(chroma_db/)      ║
-  ║     requests.get()      ║         ║                                    ║
-  ║     follow href links   ║         ║  2. Build LangChain chain:         ║
-  ║     stay within prefix  ║         ║     Chain 1: history_aware         ║
-  ║  else (DOCS_DIR):       ║         ║              _retriever            ║
-  ║  1. glob **/*.html      ║         ║     Chain 2: stuff_documents       ║
-  ║  2. BeautifulSoup       ║         ║              _chain (QA)           ║
-  ║     strip noise         ║         ║                                    ║
-  ║  3. RecursiveText       ║         ║  2. Build LangChain chain:         ║
-  ║     Splitter            ║         ║     Chain 1: history_aware         ║
-  ║     1000 chars          ║         ║              _retriever            ║
-  ║     200 overlap         ║         ║     Chain 2: stuff_documents       ║
-  ║  4. OpenAI Embeddings   ║         ║              _chain (QA)           ║
-  ║     → vectors           ║         ║                                    ║
-  ║  5. Chroma.from_docs()  ║         ║  3. chain.invoke(                  ║
-  ║     → save chroma_db/   ║         ║       input=question,              ║
-  ╚══════════╤══════════════╝         ║       chat_history=history)        ║
-             │                        ╚══════╤════════════════╤════════════╝
-             │                               │                │
-             ▼                               ▼                ▼
-  ╔══════════════════╗            ╔═══════════════╗   ╔═════════════════════╗
-  ║   ChromaDB       ║            ║   ChromaDB    ║   ║   OpenAI API        ║
-  ║   (chroma_db/)   ║            ║   MMR Search  ║   ║                     ║
-  ║                  ║            ║               ║   ║  /v1/embeddings     ║
-  ║  SQLite file     ║◄───────────║  question     ║   ║  text-embedding     ║
-  ║  6240 vectors    ║  stores    ║  vector vs    ║   ║  -3-small           ║
-  ║  + text chunks   ║            ║  6240 stored  ║   ║                     ║
-  ║  + source files  ║────────────►  vectors      ║   ║  /v1/chat/          ║
-  ╚══════════════════╝  retrieves ║               ║   ║  completions        ║
-                                  ║  Returns top  ║   ║  gpt-4o-mini        ║
-                                  ║  5 chunks     ║   ║                     ║
-                                  ╚═══════════════╝   ╚═════════════════════╝
+  ║   GET  /                    →  serves static/index.html                 ║
+  ║   GET  /api/status          →  docs_vectors, jira_vectors, total        ║
+  ║   POST /api/ingest          →  ingest_docs_async()                      ║
+  ║   POST /api/ingest/jira     →  ingest_jira_async() (full re-index)      ║
+  ║   POST /api/ingest/jira/sync→  incremental_jira_sync_async()            ║
+  ║   GET  /api/ingest/progress →  live chunks_done / chunks_total          ║
+  ║   POST /api/chat            →  rag_engine.ask() (blocking)              ║
+  ║   POST /api/chat/stream     →  rag_engine.ask_stream() (SSE)            ║
+  ║                                                                          ║
+  ║   Security: asyncio.Lock guards ingest endpoints (no race conditions)   ║
+  ║   Auth:     X-API-Key middleware (when API_KEY env var is set)          ║
+  ║   CORS:     configurable via CORS_ORIGINS env var                       ║
+  ║   POST /api/ingest/jira     →  ingest_jira_async()                      ║
+  ║   GET  /api/ingest/progress →  live fetched/total counter               ║
+  ║   POST /api/chat            →  rag.engine.ask()                         ║
+  ╚═══════════════╤═════════════════════════╤══════════════╤════════════════╝
+                  │                         │              │
+                  ▼                         ▼              ▼
+  ╔══════════════════════╗  ╔═══════════════════════╗  ╔══════════════════════╗
+  ║ ingest/              ║  ║ connectors/            ║  ║ rag_engine.py        ║
+  ║ ingest_docs.py       ║  ║ jira_client.py         ║  ║                      ║
+  ║                      ║  ║                        ║  ║ 0. connector_detector║
+  ║ crawl URL or         ║  ║ GET /search/jql        ║  ║    detect Arc component
+  ║ read DOCS_DIR        ║  ║ (Jira REST API v3)     ║  ║                      ║
+  ║ deque.popleft() O(1) ║  ║ cursor pagination      ║  ║ 1. query_router      ║
+  ║ MAX_CRAWL_PAGES cap  ║  ║ nextPageToken          ║  ║    docs/jira/hybrid  ║
+  ║ BeautifulSoup        ║  ║ → ALL issues           ║  ║                      ║
+  ║ strip noise          ║  ║                        ║  ║ 2. query_expander    ║
+  ║ → chunk 1500t        ║  ║ ingest/                ║  ║    → 5 variants      ║
+  ║ → embed              ║  ║ ingest_jira.py         ║  ║                      ║
+  ║ → arcmind_docs       ║  ║ full OR incremental    ║  ║ 3. retriever.py      ║
+  ║ → bm25_docs.pkl      ║  ║ format text            ║  ║    BM25 (keyword)    ║
+  ║ progress → UI bar    ║  ║ → chunk 1500t          ║  ║    + vector search   ║
+  ║                      ║  ║ → embed                ║  ║    merge + dedup     ║
+  ╚══════════════════════╝  ║ → arcmind_jira         ║  ║    reranker.py       ║
+                            ║ → bm25_jira.pkl        ║  ║    cross-encoder     ║
+                            ║ BM25 append mode       ║  ║                      ║
+                            ╚════════════╤═══════════╝  ║ 4. prompt_builder    ║
+                                         │              ║    doc chunks +      ║
+                                         │              ║    jira cluster      ║
+                                         │              ║    → GPT-4.1 prompt  ║
+                                         │              ║                      ║
+                                         │              ║ 5. gpt-4.1           ║
+                                         │              ║    → answer+sources  ║
+                                         │              ╚══════════╤═══════════╝
+                                         │                         │
+                                         ▼                         ▼
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║  vector_db/chroma_store.py  (ChromaDB  +  BM25 Okapi)                  ║
+  ║                                                                          ║
+  ║  ┌───────────────────────────────┐  ┌────────────────────────────────┐  ║
+  ║  │ collection: arcmind_docs      │  │ collection: arcmind_jira       │  ║
+  ║  │ ~2,800 vectors                │  │ ~17,000 – 40,000 vectors       │  ║
+  ║  │ + bm25_docs.pkl               │  │ + bm25_jira.pkl                │  ║
+  ║  └───────────────────────────────┘  └────────────────────────────────┘  ║
+  ║  Stored at CHROMA_DB_DIR  (./chroma_db  or  /app/chroma_db in Docker)   ║
+  ╚══════════════════════════════════════════════════════════════════════════╝
+                                │                    │
+                                ▼ embed calls        ▼ chat calls
+                   ╔════════════════════════════════════════╗
+                   ║  OpenAI API                            ║
+                   ║  /v1/embeddings  text-embedding-3-large║
+                   ║  /v1/chat/completions  gpt-4.1         ║
+                   ║  /v1/chat/completions  gpt-4o-mini     ║
+                   ║                       (query expansion)║
+                   ╚════════════════════════════════════════╝
 
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -516,7 +631,7 @@ HTTP Request:
 
   Body:
   {
-    "model": "text-embedding-3-small",
+    "model": "text-embedding-3-large",
     "input": "To configure SFTP, navigate to the connector settings..."
   }
 
@@ -529,7 +644,8 @@ HTTP Response:
     "usage": { "prompt_tokens": 42, "total_tokens": 42 }
   }
 
-Cost: ~$0.00002 per 1000 tokens (very cheap — whole 6240 chunk index costs ~$0.05)
+Cost: ~$0.00013 per 1000 tokens (text-embedding-3-large)
+      Indexing ~20,000 chunks costs roughly $0.15–0.20
 
 
 ──────────────────────────────────────────
@@ -545,7 +661,7 @@ HTTP Request:
 
   Body:
   {
-    "model": "gpt-4o-mini",
+    "model": "gpt-4.1",
     "temperature": 0.2,
     "messages": [
       {
@@ -595,8 +711,11 @@ HTTP Response:
     }
   }
 
-Cost: ~$0.00015 per 1000 input tokens + $0.00060 per 1000 output tokens
-      (a typical question costs less than $0.001 = less than 0.1 paise)
+Cost: gpt-4.1 — ~$0.002 per 1000 input tokens + $0.008 per 1000 output tokens
+      A typical question with 2000 tokens context costs ~$0.005 (~0.5 paise)
+
+  Note: gpt-4o-mini is used separately for query expansion (cheap call,
+  ~200 tokens, less than $0.0001 per question).
 
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -681,8 +800,16 @@ LangChain components used:
     Only the text chunks relevant to each question are sent to OpenAI.
     The full documentation is never uploaded anywhere.
 
+  ✓ SECURE
+    API-key middleware (X-API-Key) locks down all /api/* endpoints.
+    CORS is configurable — restrict to known origins in production.
+    Session IDs are validated (max 128 chars, safe charset).
+    asyncio.Lock prevents concurrent ingest race conditions.
+    BM25 pickle files are path-validated before loading (_safe_pickle_load).
+
   ✓ ALWAYS UP TO DATE
     Click ⚡ Index Docs whenever you update your HTML files.
+    Use Incremental Jira Sync to pull only the latest tickets (last N hours).
     The index rebuilds in minutes with the latest content.
 
   ✓ COST EFFECTIVE
@@ -692,23 +819,21 @@ LangChain components used:
 
   ✓ FAST
     After indexing, answers are generated in 2-5 seconds.
-    ChromaDB vector search over 4179 vectors takes milliseconds.
+    ChromaDB vector search over 20,000+ vectors takes milliseconds.
     Cross-encoder reranker runs locally (no extra API call).
+    Streaming answers via /api/chat/stream for instant first-token response.
+    ChatOpenAI and expansion LLM are singletons (no repeated instantiation).
 
   ✓ CONTEXT-AWARE
     The AI remembers your full conversation.
     Follow-up questions ("How do I do that with authentication?")
     correctly understand what "that" refers to.
 
-  ✓ NO LOCAL DOCS NEEDED
-    Documentation is crawled directly from the live URL.
-    No need to maintain a local copy of HTML files.
-    Teammates only need an OPENAI_API_KEY to get started.
-
   ✓ PORTABLE — DOCKER / PODMAN SUPPORT
     Runs in a container with docker compose up --build.
     No Python install required on teammates' machines.
     Works identically on Windows, macOS, and Linux.
+    Reranker model is pre-downloaded at build time (no runtime delay).
 
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -720,34 +845,68 @@ LangChain components used:
   OPENAI_API_KEY     (required)                Your OpenAI secret key
                                                Get from: platform.openai.com
 
-  CHAT_MODEL         gpt-4o-mini               LLM used for answering
+  API_KEY            (unset — auth disabled)   When set, all /api/* requests
+                                               must include X-API-Key header.
+                                               Leave unset for local dev only.
+
+  CORS_ORIGINS       * (all origins)           Comma-separated list of allowed
+                                               CORS origins. Restrict in prod:
+                                               https://yoursite.com
+
+  CHAT_MODEL         gpt-4.1                   LLM used for answering
                                                Options: gpt-4o, gpt-4-turbo
-                                               gpt-4o = smarter, 10x costlier
 
-  EMBEDDING_MODEL    text-embedding-3-small    Model for creating vectors
-                                               Do not change unless needed
+  EMBEDDING_MODEL    text-embedding-3-large    Model for creating vectors.
+                                               Do not change unless re-indexing.
 
-  DOCS_URL           https://cdn.cdata.com/     URL to crawl docs from.
-                     help/AZN/mft/             Takes priority over DOCS_DIR.
-                                               All pages under this prefix
-                                               are crawled automatically.
+  DOCS_URL           (unset)                   URL to crawl docs from.
+                                               Takes priority over DOCS_DIR.
 
   DOCS_DIR           ./docs                    Local HTML folder fallback.
-                                               Only used when DOCS_URL is
-                                               not set.
+                                               Only used when DOCS_URL is unset.
 
-  CHROMA_DB_DIR      ./chroma_db               Where vectors are stored
-                                               Auto-created on first ingest
+  MAX_CRAWL_PAGES    2000                      Cap on pages fetched during
+                                               a web crawl (prevents runaway).
 
-  CHUNK_SIZE         1000                      Characters per chunk
-                                               Smaller = more precise retrieval
-                                               Larger = more context per chunk
+  CHROMA_DB_DIR      ./chroma_db               Where vectors are stored.
+                                               (Overridden to /app/chroma_db
+                                               in Docker by docker-compose.yml)
 
-  CHUNK_OVERLAP      200                       Overlap between chunks
-                                               Prevents sentences being cut off
+  CHUNK_SIZE         1500                      Tokens per chunk.
+                                               Smaller = more precise retrieval.
+                                               Larger = more context per chunk.
 
-  RETRIEVER_TOP_K    5                         How many chunks to retrieve
-                                               More = more context, higher cost
+  CHUNK_OVERLAP      300                       Overlap between chunks.
+                                               Prevents sentences being cut off.
+
+  RETRIEVER_TOP_K    15                        Candidates fetched from each
+                                               collection before reranking.
+
+  DOCS_TOP_K         8                         Doc chunks passed to GPT
+                                               after reranking.
+
+  JIRA_TOP_K         6                         Jira chunks passed to GPT
+                                               after reranking.
+
+  RERANKER_ENABLED   true                      Toggle cross-encoder reranker.
+
+  RERANKER_MODEL     cross-encoder/            HuggingFace cross-encoder model.
+                     ms-marco-MiniLM-L-6-v2    ~22MB, cached locally.
+
+  RERANKER_TOP_N     8                         Total chunks kept after reranking
+                                               and passed to the LLM prompt.
+
+  JIRA_URL           (required for Jira)       Your Atlassian Cloud base URL.
+                                               e.g. https://cdatajira.atlassian.net
+
+  JIRA_EMAIL         (required for Jira)       Email address for Jira auth.
+
+  JIRA_API_TOKEN     (required for Jira)       API token from:
+                                               id.atlassian.com → Security →
+                                               API tokens
+
+  JIRA_PROJECT_KEY   (required for Jira)       Jira project key to index.
+                                               e.g. ARCESB, ARC, SUPPORT
 
 
 ════════════════════════════════════════════════════════════════════════════════

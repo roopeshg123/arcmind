@@ -1,70 +1,98 @@
 """
-FastAPI application — exposes three REST endpoints:
+ArcMind FastAPI Application
 
-  GET  /             → Serves the chat UI (static/index.html)
-  GET  /api/status   → Reports whether the vector store is ready
-  POST /api/ingest   → Triggers the document ingestion pipeline
-  POST /api/chat     → Accepts a question + history, returns an answer + sources
+REST API endpoints
+------------------
+  GET  /                    Serve the chat UI  (static/index.html)
+  GET  /api/status          Collection health check + vector counts
+  POST /api/ingest          Ingest Arc documentation (HTML)
+  POST /api/ingest/jira     Ingest Jira issues
+  POST /api/ingest/jira/sync  Incremental Jira sync (last N hours)
+  POST /api/chat            Blocking Q&A — returns full answer at once
+  POST /api/chat/stream     Streaming Q&A — Server-Sent Events (SSE)
 """
 
+import asyncio
+import functools
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Lazy import of heavy modules so startup is fast
-# ---------------------------------------------------------------------------
 import rag_engine
 from ingest import run_ingestion
+from ingest.ingest_jira import ingest_jira_async, incremental_jira_sync_async
 
 DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 
+# CORS: set CORS_ORIGINS to a comma-separated list of allowed origins.
+# Defaults to "*" (all origins) — restrict this in production.
+_CORS_ORIGINS = (
+    [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+    or ["*"]
+)
+
+# API key: set API_KEY env var to require X-API-Key on all /api/* requests.
+# Leave unset to disable auth (development only).
+_API_KEY = os.getenv("API_KEY", "").strip()
+
+
 # ---------------------------------------------------------------------------
-# Application lifespan
+# Lifespan — warm up on startup
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-load vector store, reranker, and RAG chain on startup."""
     if rag_engine.is_vector_store_ready():
-        print("[startup] Vector store found — loading into memory…")
-        rag_engine.load_vector_store()
-        print("[startup] Pre-building RAG chain and warming up reranker…")
-        rag_engine.get_rag_chain()  # builds chain + loads reranker in one shot
+        print("[startup] Docs collection found — warming up reranker…")
+        rag_engine.warmup_reranker()
+        rag_engine.get_rag_chain()   # satisfies the truthy check, warms reranker
     else:
-        print("[startup] No vector store yet — pre-warming reranker for faster first ingest…")
+        print("[startup] No docs indexed yet — pre-loading reranker…")
         rag_engine.warmup_reranker()
         print("[startup] Call POST /api/ingest to index your documentation.")
     yield
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# App
 # ---------------------------------------------------------------------------
+
 app = FastAPI(
-    title="Arc Docs RAG",
-    description="Retrieval-Augmented Generation over your Arc application documentation.",
-    version="1.0.0",
+    title="ArcMind",
+    description="Enterprise AI assistant for CData Arc — documentation + Jira knowledge.",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
 
-# Serve static files (the chat UI)
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Enforce X-API-Key header when API_KEY env var is set."""
+    if _API_KEY:
+        path = request.url.path
+        if path not in ("/",) and not path.startswith("/static"):
+            if request.headers.get("X-API-Key", "") != _API_KEY:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -73,115 +101,262 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # ---------------------------------------------------------------------------
 
 class ChatMessage(BaseModel):
-    role: str        # "user" | "assistant"
+    role:    str    # "user" | "assistant"
     content: str
 
 
 class ChatRequest(BaseModel):
-    question: str
-    history: Optional[List[ChatMessage]] = []
+    question:   str
+    history:    Optional[List[ChatMessage]] = []
+    session_id: Optional[str] = None        # server-side conversation memory key
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            if len(v) > 128:
+                raise ValueError("session_id must not exceed 128 characters")
+            if not re.match(r'^[a-zA-Z0-9_\-]+$', v):
+                raise ValueError(
+                    "session_id must only contain alphanumeric characters, "
+                    "hyphens, and underscores"
+                )
+        return v
 
 
 class ChatResponse(BaseModel):
-    answer: str
-    sources: List[dict]
+    answer:      str
+    sources:     List[dict]
+    jira_issues: List[dict] = []
 
 
 class IngestRequest(BaseModel):
-    docs_dir: Optional[str] = None
-    reset: Optional[bool] = True
+    docs_dir: Optional[str]  = None
+    reset:    Optional[bool] = True
+
+
+class JiraIngestRequest(BaseModel):
+    jql:         Optional[str]  = None
+    reset:       Optional[bool] = False
+    max_results: Optional[int]  = 0
+
+
+class JiraSyncRequest(BaseModel):
+    hours: Optional[int] = 1
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — static / status
 # ---------------------------------------------------------------------------
 
 @app.get("/", include_in_schema=False)
 async def root():
-    """Serve the chat UI."""
     return FileResponse("static/index.html")
 
 
 @app.get("/api/status")
 async def status():
-    """
-    Check whether the vector store is ready to answer questions.
-    Also returns a document count if available.
-    """
-    ready = rag_engine.is_vector_store_ready()
-
-    if ready:
-        try:
-            vs = rag_engine.load_vector_store()
-            count = vs._collection.count()
-        except Exception:
-            count = -1
-        return {"status": "ready", "vectors": count}
-
-    return {"status": "not_ready", "vectors": 0,
-            "message": "Run POST /api/ingest to index your documentation first."}
+    """Report vector store readiness and collection sizes."""
+    from vector_db.chroma_store import get_store
+    store = get_store()
+    docs_count = store.docs_count()
+    jira_count = store.jira_count()
+    ready = docs_count > 0
+    return {
+        "status":     "ready" if ready else "not_ready",
+        "docs_vectors":  docs_count,
+        "jira_vectors":  jira_count,
+        "total_vectors": docs_count + jira_count,
+        "message": None if ready else "Call POST /api/ingest to index documentation.",
+    }
 
 
-# Global flag to prevent concurrent ingestions
-_ingestion_running = False
+# ---------------------------------------------------------------------------
+# Routes — ingestion
+# ---------------------------------------------------------------------------
+
+_ingestion_lock: asyncio.Lock = asyncio.Lock()  # prevents concurrent ingest runs
+_ingest_progress: dict = {
+    "stage": "idle", "fetched": 0, "total": 0,
+    "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+}
+
+
+@app.get("/api/ingest/progress")
+async def ingest_progress():
+    """Return current ingestion progress (polled by the UI)."""
+    return _ingest_progress
 
 
 @app.post("/api/ingest")
-async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
-    """
-    Trigger the document ingestion pipeline.
-
-    By default this runs synchronously so the caller receives a result.
-    For very large doc sets you can move it to a background task instead.
-    """
-    global _ingestion_running
-    if _ingestion_running:
+async def ingest(request: IngestRequest):
+    """Ingest Arc documentation from disk or DOCS_URL."""
+    global _ingest_progress
+    if _ingestion_lock.locked():
         raise HTTPException(status_code=409, detail="Ingestion already in progress.")
 
     docs_dir = request.docs_dir or DOCS_DIR
+    if not request.docs_dir and not os.getenv("DOCS_URL", "").strip():
+        if not os.path.isdir(docs_dir):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Directory not found: '{docs_dir}'. "
+                    "Place .html files there or set DOCS_URL in your .env."
+                ),
+            )
 
-    if not os.path.isdir(docs_dir):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Directory not found: '{docs_dir}'. "
-                   "Place your .html files there and retry."
-        )
-
-    _ingestion_running = True
-    try:
-        # Release the open ChromaDB connection BEFORE ingestion deletes the directory
+    result = None
+    async with _ingestion_lock:
+        _ingest_progress = {
+            "stage": "loading", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
         rag_engine.reset_chain()
-        result = run_ingestion(docs_dir=docs_dir, reset=request.reset)
-    finally:
-        _ingestion_running = False
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(run_ingestion, docs_dir=docs_dir, reset=request.reset),
+            )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
 
-    if result["status"] == "error":
-        raise HTTPException(status_code=422, detail=result["message"])
+    if result.get("status") == "error":
+        raise HTTPException(status_code=422, detail=result.get("message"))
 
     return result
 
 
+@app.post("/api/ingest/jira")
+async def ingest_jira(request: JiraIngestRequest):
+    """Ingest Jira issues (full or filtered by JQL)."""
+    global _ingest_progress
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+
+    result = None
+    async with _ingestion_lock:
+        _ingest_progress = {
+            "stage": "fetching", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
+        try:
+            result = await ingest_jira_async(
+                jql=request.jql,
+                reset=request.reset,
+                progress=_ingest_progress,
+            )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
+
+    return result
+
+
+@app.post("/api/ingest/jira/sync")
+async def jira_sync(request: JiraSyncRequest):
+    """Incremental Jira sync — fetches issues updated in the last N hours."""
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+    async with _ingestion_lock:
+        result = await incremental_jira_sync_async(hours=request.hours or 1)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Routes — chat (blocking)
+# ---------------------------------------------------------------------------
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Answer a question using the RAG pipeline.
+    Answer a question using the full RAG pipeline (blocking response).
 
-    The client passes the full conversation history so the server is stateless.
+    The client may pass the full history in *history* OR rely on server-side
+    memory by supplying a stable *session_id*.
     """
     if not rag_engine.is_vector_store_ready():
         raise HTTPException(
             status_code=503,
-            detail="Documentation index not ready. Call POST /api/ingest first.",
+            detail="Documentation not indexed yet. Call POST /api/ingest first.",
         )
-
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    history = [{"role": m.role, "content": m.content} for m in request.history]
+    history = [{"role": m.role, "content": m.content} for m in (request.history or [])]
 
     try:
-        result = rag_engine.ask(question=request.question, chat_history=history)
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                rag_engine.ask,
+                question=request.question,
+                chat_history=history,
+                session_id=request.session_id,
+            ),
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return ChatResponse(answer=result["answer"], sources=result["sources"])
+    return ChatResponse(
+        answer=result["answer"],
+        sources=result["sources"],
+        jira_issues=result.get("jira_issues", []),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes — chat (streaming SSE)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """
+    Stream the RAG answer as Server-Sent Events.
+
+    Each event is a JSON object on a `data:` line.  Event types:
+        {"token":  "…"}          — incremental answer token
+        {"error":  "…"}          — error (stream terminates)
+        {"done": true,
+         "sources": […],
+         "jira_issues": […]}     — final metadata event after all tokens
+
+    Client usage (JavaScript):
+        const es = new EventSource('/api/chat/stream');
+        // or use fetch with ReadableStream for POST
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(
+            status_code=503,
+            detail="Documentation not indexed yet. Call POST /api/ingest first.",
+        )
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    history = [{"role": m.role, "content": m.content} for m in (request.history or [])]
+
+    async def _generate():
+        async for event in rag_engine.ask_stream(
+            question=request.question,
+            chat_history=history,
+            session_id=request.session_id,
+        ):
+            yield event
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":               "no-cache",
+            "X-Accel-Buffering":           "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
