@@ -9,21 +9,24 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 
 | Path | Purpose |
 |---|---|
-| `main.py` | FastAPI web server — all API routes |
+| `main.py` | FastAPI web server — all API routes, API-key auth middleware, CORS |
+| `rag_engine.py` | Top-level RAG pipeline — orchestrates retrieval, reranking, and answer generation |
 | `connectors/jira_client.py` | Jira REST API v3 client with cursor pagination |
-| `ingest/ingest_docs.py` | HTML doc ingestion pipeline |
-| `ingest/ingest_jira.py` | Jira issue ingestion pipeline |
-| `ingest/chunking.py` | Token-aware text splitter |
-| `rag/retriever.py` | Hybrid BM25 + vector search with reranker |
-| `rag/query_expander.py` | LLM-driven query expansion (gpt-4o-mini) |
-| `rag/jira_clusterer.py` | Groups related Jira tickets for cleaner answers |
-| `rag/prompt_builder.py` | Builds the final GPT prompt with retrieved context |
-| `rag/memory.py` | Conversation history manager |
-| `rag/engine.py` | Top-level RAG pipeline gluing all components |
-| `vector_db/chroma_store.py` | ChromaDB + BM25 store (two collections) |
-| `static/index.html` | Chat UI served by the backend |
-| `.env` | Config template — fill in your values (placeholder values committed; real values stay local) |
-| `Dockerfile` | Two-stage container image definition |
+| `ingest/ingest_docs.py` | HTML doc ingestion — web crawl or local folder, with `MAX_CRAWL_PAGES` cap |
+| `ingest/ingest_jira.py` | Jira issue ingestion pipeline (full + incremental sync) |
+| `ingest/chunking.py` | Token-aware text splitter (1500 tokens / 300 overlap) |
+| `rag/retriever.py` | Hybrid BM25 + vector search with cross-encoder reranker |
+| `rag/query_expander.py` | LLM-driven query expansion — generates 5 query variants |
+| `rag/jira_clusterer.py` | Groups related Jira tickets for cleaner, deduplicated answers |
+| `rag/prompt_builder.py` | Builds the final GPT prompt with doc + Jira context |
+| `rag/conversation_memory.py` | Per-session conversation history manager |
+| `rag/connector_detector.py` | Detects Arc connector/component references in queries |
+| `rag/query_router.py` | Routes queries to docs-only, Jira-only, or hybrid retrieval |
+| `rag/reranker.py` | Cross-encoder reranker wrapper (`ms-marco-MiniLM-L-6-v2`) |
+| `vector_db/chroma_store.py` | ChromaDB + BM25 store — two collections, BM25 append-mode incremental sync |
+| `static/index.html` | Chat UI — live progress bar for both doc and Jira indexing |
+| `.env` | Local config — **never commit** (contains your API keys) |
+| `Dockerfile` | Two-stage container build (builder + lean runtime, reranker pre-downloaded) |
 | `docker-compose.yml` | Run the full app with one command |
 | `chroma_db/` | Vector store — auto-created after first indexing |
 
@@ -177,9 +180,11 @@ Stop: `docker compose down`
 | `/` | GET | Serves the chat UI |
 | `/api/status` | GET | Returns vector counts (`docs_vectors`, `jira_vectors`, `total_vectors`) |
 | `/api/ingest` | POST | Index / re-index HTML documentation |
-| `/api/ingest/jira` | POST | Index / re-index Jira project |
-| `/api/ingest/progress` | GET | Live progress during Jira indexing |
-| `/api/chat` | POST | Ask a question, get an answer with sources |
+| `/api/ingest/jira` | POST | Full index / re-index of Jira project |
+| `/api/ingest/jira/sync` | POST | Incremental sync — fetches only issues updated in the last N hours |
+| `/api/ingest/progress` | GET | Live progress (chunks done / total) during doc or Jira indexing |
+| `/api/chat` | POST | Ask a question, get a full answer with sources (blocking) |
+| `/api/chat/stream` | POST | Ask a question, get a streaming answer via Server-Sent Events (SSE) |
 
 ### `/api/chat` request
 
@@ -207,16 +212,18 @@ Stop: `docker compose down`
 
 ### Indexing
 
-**Docs** — HTML files are parsed by BeautifulSoup, split into 600-token chunks with 100-token overlap, embedded with `text-embedding-3-large`, and stored in the `arcmind_docs` ChromaDB collection. A companion BM25 index is pickled in the same folder.
+**Docs** — HTML files are parsed by BeautifulSoup, split into 1500-token chunks with 300-token overlap, embedded with `text-embedding-3-large`, and stored in the `arcmind_docs` ChromaDB collection. A companion BM25 index is pickled alongside. A `MAX_CRAWL_PAGES` cap prevents unbounded web crawls. Live progress is streamed via `/api/ingest/progress` and shown in the UI progress bar.
 
-**Jira** — All issues are fetched via the Jira REST API v3 with cursor-based pagination (so all tickets are retrieved regardless of project size). Each issue is formatted as structured text (key, summary, type, status, priority, description, comments, fix versions, sprint) then chunked and embedded into the `arcmind_jira` collection.
+**Jira** — All issues are fetched via Jira REST API v3 with cursor-based pagination (so all tickets are retrieved regardless of project size). Each issue is formatted as structured text (key, summary, type, status, priority, description, comments, fix versions, sprint) then chunked and embedded into the `arcmind_jira` collection. The BM25 index uses **append mode** during incremental syncs to avoid a full rebuild. Use `/api/ingest/jira/sync` for fast incremental updates.
 
 ### Querying
 
-1. **Query expansion** — `gpt-4o-mini` rewrites your question into 5 variants covering synonyms, acronym expansions (e.g. "MDN" → "Message Disposition Notification"), and related sub-topics.
-2. **Hybrid retrieval** — Each variant is searched across both ChromaDB (semantic) and BM25 (keyword). Results from both collections are merged and deduplicated.
-3. **Reranking** — A cross-encoder (`ms-marco-MiniLM-L-6-v2`) scores each candidate against your original question for precision.
-4. **Answer generation** — Top doc chunks and a Jira ticket cluster are injected into a prompt and sent to `gpt-4.1`.
+1. **Connector detection** — `connector_detector.py` identifies any Arc connector or component name in the query for targeted Jira filtering.
+2. **Query routing** — `query_router.py` decides whether to search docs-only, Jira-only, or both collections.
+3. **Query expansion** — The question is rewritten into 5 variants covering synonyms, acronym expansions, and related sub-topics.
+4. **Hybrid retrieval** — Each variant is searched across both ChromaDB (semantic) and BM25 (keyword). Results are merged and deduplicated.
+5. **Reranking** — A local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores all candidates against the original question. Top `RERANKER_TOP_N` chunks are kept.
+6. **Answer generation** — Top doc chunks and a clustered Jira summary are injected into a strict prompt and sent to `gpt-4.1`. Streaming is available via `/api/chat/stream`.
 
 ---
 
@@ -224,18 +231,25 @@ Stop: `docker compose down`
 
 | Variable | Default | Effect |
 |---|---|---|
+| `OPENAI_API_KEY` | *(required)* | Your OpenAI secret key |
+| `API_KEY` | *(unset)* | When set, all `/api/*` requests must include `X-API-Key: <value>`. Leave unset in dev. |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins. Restrict in production (e.g. `https://yoursite.com`). |
 | `CHAT_MODEL` | `gpt-4.1` | OpenAI model for answers |
 | `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model |
 | `CHUNK_SIZE` | `1500` | Tokens per chunk |
 | `CHUNK_OVERLAP` | `300` | Token overlap between chunks |
-| `RETRIEVER_TOP_K` | `15` | Candidates fetched before reranking |
+| `RETRIEVER_TOP_K` | `15` | Candidates fetched from each collection before reranking |
+| `DOCS_TOP_K` | `8` | Doc chunks passed to GPT after reranking |
+| `JIRA_TOP_K` | `6` | Jira chunks passed to GPT after reranking |
 | `RERANKER_ENABLED` | `true` | Toggle cross-encoder reranker |
-| `RERANKER_TOP_N` | `8` | Chunks passed to GPT after reranking |
+| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
+| `RERANKER_TOP_N` | `8` | Total chunks passed to GPT after reranking |
+| `MAX_CRAWL_PAGES` | `2000` | Max pages fetched during a web crawl |
 | `CHROMA_DB_DIR` | `./chroma_db` | Vector store and BM25 pickle location |
-| `JIRA_BASE_URL` | — | Atlassian Cloud URL |
+| `JIRA_URL` | — | Atlassian Cloud URL (e.g. `https://your-org.atlassian.net`) |
 | `JIRA_EMAIL` | — | Login email for Jira API auth |
 | `JIRA_API_TOKEN` | — | API token from Atlassian account settings |
-| `JIRA_PROJECT_KEY` | — | Jira project key to index (e.g. `ARC`) |
+| `JIRA_PROJECT_KEY` | — | Jira project key to index (e.g. `ARCESB`) |
 
 ---
 
