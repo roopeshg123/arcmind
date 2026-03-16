@@ -1,7 +1,7 @@
 # ArcMind — Enterprise AI Assistant for Arc
 
-Chat with your Arc documentation **and** Jira ticket history using OpenAI GPT and a local hybrid search engine.
-Ask questions in plain English and get accurate, sourced answers instantly — from both your docs and your real support/bug history.
+Chat with your Arc documentation, **Jira ticket history**, and **Confluence wiki** using OpenAI GPT and a local hybrid search engine.
+Ask questions in plain English and get accurate, sourced answers instantly — from your product docs, real support/bug history, and internal knowledge base.
 
 ---
 
@@ -12,19 +12,21 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 | `main.py` | FastAPI web server — all API routes, API-key auth middleware, CORS |
 | `rag_engine.py` | Top-level RAG pipeline — orchestrates retrieval, reranking, streaming, query logging, and session memory |
 | `connectors/jira_client.py` | Jira REST API v3 client with cursor pagination |
+| `connectors/confluence_client.py` | Confluence REST API v1 client — fetches pages with full body, breadcrumbs, labels, and corrected `/wiki` URLs |
 | `ingest/ingest_docs.py` | HTML doc ingestion — web crawl or local folder, with `MAX_CRAWL_PAGES` cap; `smart_docs_update()` for SHA-256 diff-based incremental update |
 | `ingest/ingest_jira.py` | Jira ingestion pipeline (full, incremental sync, and smart diff update); indexes ticket comments as separate documents |
-| `ingest/chunking.py` | Token-aware text splitter (1500 tokens / 300 overlap for docs; 600 / 100 for Jira) |
-| `rag/retriever.py` | Hybrid BM25 + vector search with cross-encoder reranker |
+| `ingest/ingest_confluence.py` | Confluence ingestion pipeline (full, incremental CQL-based sync, and smart diff update) |
+| `ingest/chunking.py` | Token-aware text splitter (1500 tokens / 300 overlap for docs; 600 / 100 for Jira; 800 / 150 for Confluence) |
+| `rag/retriever.py` | Hybrid BM25 + vector search across docs, Jira, and Confluence with cross-encoder reranker |
 | `rag/query_expander.py` | LLM-driven query expansion — generates 5 query variants |
 | `rag/jira_clusterer.py` | Groups related Jira tickets for cleaner, deduplicated answers |
-| `rag/prompt_builder.py` | Builds the final GPT prompt with doc + Jira context |
+| `rag/prompt_builder.py` | Builds the final GPT prompt with doc + Confluence + Jira context |
 | `rag/conversation_memory.py` | Per-session server-side conversation history manager |
 | `rag/connector_detector.py` | Detects Arc connector/component references in queries |
 | `rag/query_router.py` | Routes queries to docs-only, Jira-only, or hybrid retrieval |
 | `rag/reranker.py` | Cross-encoder reranker wrapper (`ms-marco-MiniLM-L-6-v2`) |
-| `vector_db/chroma_store.py` | ChromaDB + BM25 store — two collections, BM25 append-mode incremental sync, smart-diff helpers |
-| `static/index.html` | Chat UI — live progress bar for both doc and Jira indexing |
+| `vector_db/chroma_store.py` | ChromaDB + BM25 store — **three collections** (docs, jira, confluence), BM25 append-mode incremental sync, smart-diff helpers |
+| `static/index.html` | Chat UI — live progress bar for docs, Jira, and Confluence indexing; clickable hyperlinks in answers |
 | `logs/query_log.jsonl` | Auto-created JSONL query log — records every question with expanded queries, retrieved count, and answer preview |
 | `.env` | Local config — **never commit** (contains your API keys) |
 | `Dockerfile` | Two-stage container build (builder + lean runtime, reranker pre-downloaded) |
@@ -41,12 +43,12 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 | **FastAPI** | REST API framework |
 | **Uvicorn** | ASGI server |
 | **LangChain** | Document splitting, prompt chains, LLM integration |
-| **ChromaDB** | Local vector database (two collections: docs + jira) |
+| **ChromaDB** | Local vector database (**three collections**: docs + jira + confluence) |
 | **OpenAI API** | Embeddings (`text-embedding-3-large`) + Chat (`gpt-4.1`) |
 | **rank-bm25** | BM25 keyword search (hybrid retrieval alongside vectors) |
 | **sentence-transformers** | Cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`) |
 | **BeautifulSoup4 / lxml** | HTML parsing and text extraction |
-| **requests** | HTTP client for web crawling and Jira API |
+| **httpx** | Async HTTP client for Jira and Confluence APIs |
 | **tiktoken** | Token counting for chunking |
 | **Docker / Podman** | Container runtime for easy team deployment |
 
@@ -59,6 +61,7 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 - **OpenAI API Key** — [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (billing must be enabled)
 - **Your docs folder** — folder containing your `.html` documentation files
 - *(Optional)* **Jira API token** — from [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
+- *(Optional)* **Confluence API token** — same Atlassian token works for both Jira and Confluence
 
 ---
 
@@ -102,10 +105,19 @@ DOCS_DIR=C:\path\to\your\html\docs
 To also enable Jira:
 
 ```env
-JIRA_BASE_URL=https://your-org.atlassian.net
+JIRA_URL=https://your-org.atlassian.net
 JIRA_EMAIL=you@yourcompany.com
 JIRA_API_TOKEN=your-jira-api-token
 JIRA_PROJECT_KEY=ARC
+```
+
+To also enable Confluence (same API token as Jira):
+
+```env
+CONFLUENCE_URL=https://your-org.atlassian.net
+CONFLUENCE_EMAIL=you@yourcompany.com
+CONFLUENCE_API_TOKEN=your-api-token
+CONFLUENCE_SPACES=DOCS,KB
 ```
 
 ### Step 5 — Start the app
@@ -120,9 +132,10 @@ Open [http://localhost:8000](http://localhost:8000).
 
 1. Click **⚡ Index Docs** to index your HTML documentation.
 2. *(Optional)* Click **🔗 Index Jira** to index your Jira project.
+3. *(Optional)* Click **📄 Index Confluence** to index your Confluence spaces.
 
 The status badge shows live progress and final counts:
-`✓ Ready — 20,479 vectors (docs: 2809, jira: 17670)`
+`✓ Ready — 25,000 vectors (docs: 2809, jira: 17670, confluence: 4521)`
 
 ---
 
@@ -179,13 +192,16 @@ Stop: `docker compose down`
 | Endpoint | Method | Description |
 |---|---|---|
 | `/` | GET | Serves the chat UI |
-| `/api/status` | GET | Returns vector counts (`docs_vectors`, `jira_vectors`, `total_vectors`) |
+| `/api/status` | GET | Returns vector counts (`docs_vectors`, `jira_vectors`, `confluence_vectors`, `total_vectors`) |
 | `/api/ingest` | POST | Full index / re-index HTML documentation |
 | `/api/ingest/update` | POST | **Smart incremental docs update** — SHA-256 diff, only re-indexes new or changed files |
 | `/api/ingest/jira` | POST | Full index / re-index of Jira project |
 | `/api/ingest/jira/update` | POST | **Smart incremental Jira update** — content-hash diff, only re-indexes new or changed tickets |
 | `/api/ingest/jira/sync` | POST | Incremental sync — fetches only issues updated in the last N hours |
-| `/api/ingest/progress` | GET | Live progress (chunks done / total) during doc or Jira indexing |
+| `/api/ingest/confluence` | POST | Full index / re-index of Confluence spaces |
+| `/api/ingest/confluence/update` | POST | **Smart incremental Confluence update** — content-hash diff, only re-indexes changed pages |
+| `/api/ingest/confluence/sync` | POST | Incremental sync — fetches only pages updated in the last N hours (CQL) |
+| `/api/ingest/progress` | GET | Live progress (chunks done / total) during any indexing operation |
 | `/api/chat` | POST | Ask a question, get a full answer with sources (blocking) |
 | `/api/chat/stream` | POST | Ask a question, get a streaming answer via Server-Sent Events (SSE) |
 
@@ -223,16 +239,20 @@ Stop: `docker compose down`
 
 **Smart Jira update** (`/api/ingest/jira/update`) — Fetches all tickets, computes a SHA-256 content hash per ticket (text + comments), and diffs against the stored state. New and changed tickets are re-embedded; tickets deleted in Jira are removed from the store. Unchanged tickets are skipped entirely.
 
+**Confluence** — Pages are fetched via Confluence REST API v1 with full pagination. Storage-format HTML is parsed to plain text (stripping macros, scripts, and layout tags). Each page is chunked at 800 tokens / 150 overlap and stored in the `arcmind_confluence` collection with title, space, breadcrumb path, and corrected `/wiki/` URL for direct linking.
+
+**Smart Confluence update** (`/api/ingest/confluence/update`) — Fetches all pages, computes a SHA-256 hash of each page body, and diffs against stored state. Only changed or new pages are re-embedded. Supports CQL-based incremental sync (`/api/ingest/confluence/sync`) to fetch only pages updated in the last N hours.
+
 ### Querying
 
 1. **Connector detection** — `connector_detector.py` identifies any Arc connector or component name in the query for targeted Jira filtering.
 2. **Query routing** — `query_router.py` decides whether to search docs-only, Jira-only, or both collections.
 3. **Query expansion** — The question is rewritten into 5 variants covering synonyms, acronym expansions, and related sub-topics.
-4. **Hybrid retrieval** — Each variant is searched across both ChromaDB (semantic) and BM25 (keyword). Results are merged and deduplicated.
+4. **Hybrid retrieval** — Each variant is searched across all three ChromaDB collections (docs, Jira, Confluence) using both semantic vector search and BM25. Results are merged and deduplicated.
 5. **Reranking** — A local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores all candidates against the original question. Top `RERANKER_TOP_N` chunks are kept.
-6. **Answer generation** — Top doc chunks and a clustered Jira summary are injected into a strict prompt and sent to `gpt-4.1`. Streaming is available via `/api/chat/stream`.
+6. **Answer generation** — Top doc chunks, Confluence wiki pages, and a clustered Jira summary are injected into a strict prompt and sent to `gpt-4.1`. Streaming is available via `/api/chat/stream`. Confluence citations are rendered as clickable hyperlinks.
 7. **Session memory** — When a `session_id` is provided, server-side conversation history is maintained per session across multiple turns.
-8. **Query logging** — Every question is appended to `logs/query_log.jsonl` with the expanded queries, retrieval counts, and answer preview for self-improvement analysis.
+8. **Query logging** — Every question is appended to `logs/query_log.jsonl` with the expanded queries, retrieval counts (docs + jira + confluence), and answer preview for self-improvement analysis.
 
 ---
 
@@ -250,6 +270,7 @@ Stop: `docker compose down`
 | `RETRIEVER_TOP_K` | `15` | Candidates fetched from each collection before reranking |
 | `DOCS_TOP_K` | `6` | Doc chunks passed to GPT after reranking |
 | `JIRA_TOP_K` | `4` | Jira chunks passed to GPT after reranking |
+| `CONFLUENCE_TOP_K` | `4` | Confluence chunks passed to GPT after reranking |
 | `RERANKER_ENABLED` | `true` | Toggle cross-encoder reranker |
 | `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
 | `RERANKER_TOP_N` | `5` | Total chunks passed to GPT after reranking |
@@ -260,6 +281,11 @@ Stop: `docker compose down`
 | `JIRA_EMAIL` | — | Login email for Jira API auth |
 | `JIRA_API_TOKEN` | — | API token from Atlassian account settings |
 | `JIRA_PROJECT_KEY` | — | Jira project key to index (e.g. `ARCESB`) |
+| `CONFLUENCE_URL` | — | Atlassian Cloud URL — same as `JIRA_URL` |
+| `CONFLUENCE_EMAIL` | — | Same email as Jira |
+| `CONFLUENCE_API_TOKEN` | — | Same API token as Jira |
+| `CONFLUENCE_SPACES` | — | Comma-separated space keys (e.g. `DOCS,KB`) |
+| `CONFLUENCE_PAGE_SIZE` | `100` | Pages per API request (max 250) |
 
 ---
 

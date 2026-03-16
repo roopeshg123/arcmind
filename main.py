@@ -3,13 +3,16 @@ ArcMind FastAPI Application
 
 REST API endpoints
 ------------------
-  GET  /                    Serve the chat UI  (static/index.html)
-  GET  /api/status          Collection health check + vector counts
-  POST /api/ingest          Ingest Arc documentation (HTML)
-  POST /api/ingest/jira     Ingest Jira issues
-  POST /api/ingest/jira/sync  Incremental Jira sync (last N hours)
-  POST /api/chat            Blocking Q&A — returns full answer at once
-  POST /api/chat/stream     Streaming Q&A — Server-Sent Events (SSE)
+  GET  /                          Serve the chat UI  (static/index.html)
+  GET  /api/status                Collection health check + vector counts
+  POST /api/ingest                Ingest Arc documentation (HTML)
+  POST /api/ingest/jira           Ingest Jira issues
+  POST /api/ingest/jira/sync      Incremental Jira sync (last N hours)
+  POST /api/ingest/confluence     Ingest Confluence pages
+  POST /api/ingest/confluence/sync  Incremental Confluence sync (last N hours)
+  POST /api/ingest/confluence/update  Smart Confluence update (changed pages only)
+  POST /api/chat                  Blocking Q&A — returns full answer at once
+  POST /api/chat/stream           Streaming Q&A — Server-Sent Events (SSE)
 """
 
 import asyncio
@@ -32,6 +35,11 @@ import rag_engine
 from ingest import run_ingestion
 from ingest.ingest_jira import ingest_jira_async, incremental_jira_sync_async, smart_jira_update_async
 from ingest.ingest_docs import smart_docs_update
+from ingest.ingest_confluence import (
+    ingest_confluence_async,
+    incremental_confluence_sync_async,
+    smart_confluence_update_async,
+)
 
 DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 
@@ -70,8 +78,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ArcMind",
-    description="Enterprise AI assistant for CData Arc — documentation + Jira knowledge.",
-    version="2.0.0",
+    description="Enterprise AI assistant for CData Arc — documentation + Jira + Confluence knowledge.",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -146,6 +154,17 @@ class JiraSyncRequest(BaseModel):
     hours: Optional[int] = 1
 
 
+class ConfluenceIngestRequest(BaseModel):
+    space_keys:  Optional[List[str]] = None
+    reset:       Optional[bool]      = False
+    max_results: Optional[int]       = 0
+
+
+class ConfluenceSyncRequest(BaseModel):
+    hours:      Optional[int]       = 1
+    space_keys: Optional[List[str]] = None
+
+
 # ---------------------------------------------------------------------------
 # Routes — static / status
 # ---------------------------------------------------------------------------
@@ -162,12 +181,14 @@ async def status():
     store = get_store()
     docs_count = store.docs_count()
     jira_count = store.jira_count()
+    confluence_count = store.confluence_count()
     ready = docs_count > 0
     return {
-        "status":     "ready" if ready else "not_ready",
-        "docs_vectors":  docs_count,
-        "jira_vectors":  jira_count,
-        "total_vectors": docs_count + jira_count,
+        "status":              "ready" if ready else "not_ready",
+        "docs_vectors":        docs_count,
+        "jira_vectors":        jira_count,
+        "confluence_vectors":  confluence_count,
+        "total_vectors":       docs_count + jira_count + confluence_count,
         "message": None if ready else "Call POST /api/ingest to index documentation.",
     }
 
@@ -419,6 +440,79 @@ async def chat_stream(request: ChatRequest):
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Routes — Confluence ingestion
+# ---------------------------------------------------------------------------
+
+@app.post("/api/ingest/confluence")
+async def ingest_confluence(request: ConfluenceIngestRequest):
+    """Ingest Confluence pages (full or filtered by space keys)."""
+    global _ingest_progress
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+
+    result = None
+    async with _ingestion_lock:
+        _ingest_progress = {
+            "stage": "fetching", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
+        try:
+            result = await ingest_confluence_async(
+                space_keys=request.space_keys or None,
+                reset=request.reset,
+                max_results=request.max_results or 0,
+                progress=_ingest_progress,
+            )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
+
+    return result
+
+
+@app.post("/api/ingest/confluence/sync")
+async def confluence_sync(request: ConfluenceSyncRequest):
+    """Incremental Confluence sync — fetches pages updated in the last N hours."""
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+    async with _ingestion_lock:
+        result = await incremental_confluence_sync_async(
+            hours=request.hours or 1,
+            space_keys=request.space_keys or None,
+        )
+    return result
+
+
+@app.post("/api/ingest/confluence/update")
+async def confluence_smart_update(request: ConfluenceIngestRequest):
+    """Smart incremental Confluence update — only re-indexes changed or new pages."""
+    global _ingest_progress
+    if _ingestion_lock.locked():
+        raise HTTPException(status_code=409, detail="Ingestion already in progress.")
+
+    result = None
+    async with _ingestion_lock:
+        _ingest_progress = {
+            "stage": "fetching", "fetched": 0, "total": 0,
+            "vectors": 0, "chunks_done": 0, "chunks_total": 0,
+        }
+        try:
+            result = await smart_confluence_update_async(
+                space_keys=request.space_keys or None,
+                progress=_ingest_progress,
+            )
+        finally:
+            _ingest_progress = {
+                "stage": "idle", "fetched": 0, "total": 0,
+                "vectors": result.get("vectors_stored", 0) if result else 0,
+            }
+
+    return result
 
 
 # ---------------------------------------------------------------------------

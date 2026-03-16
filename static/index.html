@@ -305,6 +305,8 @@
   <button id="update-docs-btn" onclick="triggerDocsUpdate()" title="Incremental update: only re-embed new or changed files">🔄 Update Docs</button>
   <button id="jira-btn" class="primary" onclick="triggerJiraIngest()" title="Full re-index: drop all Jira vectors and rebuild from scratch">🔗 Index Jira</button>
   <button id="update-jira-btn" onclick="triggerJiraUpdate()" title="Incremental update: only re-embed new or changed tickets">🔄 Update Jira</button>
+  <button id="confluence-btn" class="primary" onclick="triggerConfluenceIngest()" title="Full re-index: drop all Confluence vectors and rebuild from scratch">📄 Index Confluence</button>
+  <button id="update-confluence-btn" onclick="triggerConfluenceUpdate()" title="Incremental update: only re-embed new or changed pages">🔄 Update Confluence</button>
   <button onclick="clearChat()">🗑 Clear Chat</button>
   <span id="ingest-status"></span>
 </div>
@@ -388,7 +390,7 @@
       const data = await res.json();
       if (data.status === "ready") {
         badge.className = "ready";
-        badge.textContent = `✓ Ready — ${data.total_vectors.toLocaleString()} vectors (docs: ${data.docs_vectors}, jira: ${data.jira_vectors})`;
+        badge.textContent = `✓ Ready — ${data.total_vectors.toLocaleString()} vectors (docs: ${data.docs_vectors}, jira: ${data.jira_vectors}, confluence: ${data.confluence_vectors ?? 0})`;
       } else {
         badge.className = "not_ready";
         badge.textContent = "✗ Not indexed";
@@ -656,6 +658,126 @@
     }
   }
 
+  async function triggerConfluenceIngest() {
+    const btn    = document.getElementById("confluence-btn");
+    const status = document.getElementById("ingest-status");
+    const badge  = document.getElementById("status-badge");
+    btn.disabled = true;
+    status.textContent = "⏳ Fetching Confluence pages… 0 fetched";
+    badge.className = "not_ready";
+    badge.textContent = "↻ Re-indexing Confluence…";
+    showProgress(0, "Fetching pages…");
+
+    let pollTimer = setInterval(async () => {
+      try {
+        const p = await (await fetch("/api/ingest/progress")).json();
+        if (p.stage === "fetching") {
+          status.textContent = `⏳ Fetching Confluence pages… ${p.fetched.toLocaleString()} fetched`;
+          showProgress(0, `${p.fetched.toLocaleString()} pages fetched`);
+        } else if (p.stage === "embedding") {
+          const done  = p.chunks_done  || 0;
+          const total = p.chunks_total || 0;
+          if (total > 0) {
+            const pct = Math.round((done / total) * 100);
+            status.textContent = `⚙️ Embedding… ${done.toLocaleString()} / ${total.toLocaleString()} chunks (${p.fetched.toLocaleString()} pages)`;
+            showProgress(pct, `${pct}% — ${done.toLocaleString()} of ${total.toLocaleString()} chunks embedded`);
+          } else {
+            status.textContent = `⚙️ Preparing ${p.fetched.toLocaleString()} pages for embedding…`;
+            showProgress(0, "Chunking documents…");
+          }
+        }
+      } catch (_) {}
+    }, 1000);
+
+    try {
+      const res  = await fetch("/api/ingest/confluence", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reset: true }),
+      });
+      clearInterval(pollTimer);
+      const data = await res.json();
+      if (res.ok) {
+        status.textContent =
+          `✓ Confluence: ${data.pages_fetched.toLocaleString()} page(s) → ${data.vectors_stored.toLocaleString()} vectors`;
+        showProgress(100, "Complete!");
+        setTimeout(hideProgress, 3000);
+        checkStatus();
+      } else {
+        status.textContent = `✗ Confluence error: ${data.detail}`;
+        hideProgress();
+      }
+    } catch (e) {
+      clearInterval(pollTimer);
+      status.textContent = "✗ Network error (check CONFLUENCE_* vars in .env)";
+      hideProgress();
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function triggerConfluenceUpdate() {
+    const btn    = document.getElementById("update-confluence-btn");
+    const status = document.getElementById("ingest-status");
+    const badge  = document.getElementById("status-badge");
+    btn.disabled = true;
+    status.textContent = "⏳ Fetching Confluence pages for comparison…";
+    badge.className = "not_ready";
+    badge.textContent = "↻ Updating Confluence…";
+    showProgress(0, "Fetching pages…");
+
+    let pollTimer = setInterval(async () => {
+      try {
+        const p = await (await fetch("/api/ingest/progress")).json();
+        if (p.stage === "fetching") {
+          status.textContent = `⏳ Fetching Confluence pages… ${p.fetched.toLocaleString()} fetched`;
+          showProgress(0, `${p.fetched.toLocaleString()} pages fetched`);
+        } else if (p.stage === "embedding") {
+          const done  = p.chunks_done  || 0;
+          const total = p.chunks_total || 0;
+          if (total > 0) {
+            const pct = Math.round((done / total) * 100);
+            status.textContent = `⚙️ Embedding changes… ${done.toLocaleString()} / ${total.toLocaleString()} chunks`;
+            showProgress(pct, `${pct}% — ${done.toLocaleString()} of ${total.toLocaleString()} chunks embedded`);
+          } else {
+            status.textContent = `⚙️ Preparing changed pages…`;
+            showProgress(0, "Chunking…");
+          }
+        }
+      } catch (_) {}
+    }, 1000);
+
+    try {
+      const res  = await fetch("/api/ingest/confluence/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      clearInterval(pollTimer);
+      const data = await res.json();
+      if (res.ok) {
+        if (data.message && data.message.includes("up to date")) {
+          status.textContent = `✓ Confluence already up to date — all pages unchanged.`;
+        } else {
+          status.textContent =
+            `✓ Confluence: ${data.updated.toLocaleString()} updated, ${data.skipped.toLocaleString()} unchanged → ${data.vectors_stored.toLocaleString()} vectors`;
+        }
+        showProgress(100, "Complete!");
+        setTimeout(hideProgress, 3000);
+        checkStatus();
+      } else {
+        status.textContent = `✗ Confluence error: ${data.detail}`;
+        hideProgress();
+      }
+    } catch (e) {
+      clearInterval(pollTimer);
+      status.textContent = "✗ Network error (check CONFLUENCE_* vars in .env)";
+      hideProgress();
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   // ---------------------------------------------------------------- chat
   function handleKey(e) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -860,6 +982,9 @@
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     // italic
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // markdown links [text](url) — rendered as clickable hyperlinks
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#7c8ff5;text-decoration:underline;">$1</a>');
     // headers
     html = html.replace(/^### (.+)$/gm, '<strong>$1</strong>');
     html = html.replace(/^## (.+)$/gm, '<strong>$1</strong>');

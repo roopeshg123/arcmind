@@ -4,6 +4,7 @@
   Project   : Arc Docs AI Assistant (ArcMind)
   Type      : RAG-Powered AI Chatbot
   Path      : D:\arcmind
+  Version   : 2.1.0
   Date      : March 2026
 ================================================================================
 
@@ -12,10 +13,12 @@
  PART 1 — WHAT IS THIS PROJECT?
 ════════════════════════════════════════════════════════════════════════════════
 
-This project is an AI-powered assistant that reads your Arc application's
-HTML documentation and answers questions about it through a chat interface.
+This project is an AI-powered assistant that reads your Arc application’s
+HTML documentation, Jira ticket history, and Confluence wiki pages, then
+answers questions through a chat interface.
 
-Think of it as a private ChatGPT that ONLY knows about YOUR application.
+Think of it as a private ChatGPT that ONLY knows about YOUR application
+and YOUR team’s internal knowledge.
 
 Instead of searching through hundreds of HTML files manually, you type a
 question in natural language and instantly get an accurate, sourced answer.
@@ -225,8 +228,12 @@ INDEXING PHASE (runs once when you click ⚡ Index Docs):
 
   Step 4: STORE
     ┌─────────────────────────────────────────┐
-    │  All 4179 vectors + original text       │
-    │  saved to ChromaDB (local SQLite file)  │
+    │  All vectors + original text saved to   │
+    │  ChromaDB (local SQLite file)           │
+    │  THREE collections:                     │
+    │   arcmind_docs        (doc chunks)       │
+    │   arcmind_jira        (ticket chunks)    │
+    │   arcmind_confluence  (wiki page chunks) │
     │  Located at: ./chroma_db/               │
     └─────────────────────────────────────────┘
 
@@ -285,7 +292,9 @@ QUERY PHASE (runs every time you ask a question):
     │  Each of the 5 variants is searched:    │
     │   a) ChromaDB vector search (semantic)  │
     │   b) BM25 keyword search (exact terms)  │
-    │  Across the relevant collection(s).     │
+    │  Across THREE collections:              │
+    │   arcmind_docs, arcmind_jira,           │
+    │   arcmind_confluence                   │
     │  Results merged + deduplicated.         │
     │  Top RETRIEVER_TOP_K candidates kept.   │
     └─────────────────────────────────────────┘
@@ -303,18 +312,20 @@ QUERY PHASE (runs every time you ask a question):
     ┌─────────────────────────────────────────┐
     │  Prompt sent to gpt-4.1:                │
     │                                         │
-    │  SYSTEM: "You are a helpful assistant.  │
-    │  Answer using ONLY this documentation:  │
+    │  SYSTEM: "You are ArcMind assistant.    │
+    │   [Arc Documentation Context]           │
     │   [chunk 1 from REST.html]              │
     │   [chunk 2 from REST.html]              │
-    │   [chunk 3 from Webhook.html]           │
-    │   [Jira cluster: ARC-1234, ARC-5678]"  │
+    │   [Confluence Wiki Context]             │
+    │   [page: REST Setup Guide (with URL)]   │
+    │   [Jira Issues Context]                 │
+    │   [cluster: ARC-1234, ARC-5678]"        │
     │                                         │
     │  HISTORY: [previous messages]           │
     │  USER:    "How do I authenticate it?"   │
     │                                         │
-    │  GPT reads the chunks and writes        │
-    │  a grounded, accurate answer.           │
+    │  Confluence links rendered as clickable │
+    │  hyperlinks in the chat UI.             │
     │  Streaming available via /api/chat/stream│
     └─────────────────────────────────────────┘
 
@@ -322,11 +333,14 @@ QUERY PHASE (runs every time you ask a question):
     ┌─────────────────────────────────────────┐
     │  Answer text sent back to browser       │
     │  Source files listed below the answer   │
+    │  Confluence pages cited as clickable    │
+    │  hyperlinks (title + /wiki/ URL)        │
     │                                         │
     │  _log_query() appends a JSON record to  │
     │  logs/query_log.jsonl:                  │
     │   {ts, question, expanded_queries,      │
     │    docs_retrieved, jira_retrieved,      │
+    │    confluence_retrieved,               │
     │    answer_preview (first 500 chars)}    │
     │                                         │
     │  session_id memory updated if provided  │
@@ -342,10 +356,13 @@ QUERY PHASE (runs every time you ask a question):
   ├── .env                    ← Local config — NEVER commit (contains real API keys)
   │                             OPENAI_API_KEY, API_KEY, CORS_ORIGINS,
   │                             JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN,
-  │                             JIRA_PROJECT_KEY, model names, paths
+  │                             JIRA_PROJECT_KEY,
+  │                             CONFLUENCE_URL, CONFLUENCE_EMAIL,
+  │                             CONFLUENCE_API_TOKEN, CONFLUENCE_SPACES,
+  │                             model names, paths
   ├── requirements.txt        ← pip install -r requirements.txt
   │
-  ├── main.py                 ← FastAPI web server (v2.0.0)
+  ├── main.py                 ← FastAPI web server (v2.1.0)
   │                             API routes + asyncio.Lock (race condition safe)
   │                             API-key auth middleware (X-API-Key header)
   │                             CORS via CORS_ORIGINS env var
@@ -353,27 +370,38 @@ QUERY PHASE (runs every time you ask a question):
   │                             Routes: /api/chat, /api/chat/stream,
   │                             /api/ingest, /api/ingest/update,
   │                             /api/ingest/jira, /api/ingest/jira/update,
-  │                             /api/ingest/jira/sync, /api/ingest/progress,
-  │                             /api/status
+  │                             /api/ingest/jira/sync,
+  │                             /api/ingest/confluence,
+  │                             /api/ingest/confluence/update,
+  │                             /api/ingest/confluence/sync,
+  │                             /api/ingest/progress, /api/status
   │
   ├── rag_engine.py           ← Top-level RAG pipeline
   │                             ChatOpenAI singleton caching (_get_llm)
   │                             Async-safe: wraps pipeline in run_in_executor
-  │                             Configurable top-k via DOCS_TOP_K/JIRA_TOP_K
+  │                             Configurable top-k via DOCS_TOP_K/JIRA_TOP_K/
+  │                             CONFLUENCE_TOP_K
   │                             reset_chain() clears LLM + chain singletons
   │                             ask_stream() — async generator for SSE streaming
   │                             _log_query() — appends JSONL to logs/ per query
   │                             session_id support via conversation_memory
   │
   ├── connectors/
-  │   └── jira_client.py      ← Jira REST API v3 client
-  │                             Cursor-based pagination (nextPageToken)
-  │                             Fetches: summary, description, comments,
-  │                             status, type, priority, labels, components,
-  │                             fix versions, sprint, created, updated
+  │   ├── jira_client.py      ← Jira REST API v3 client
+  │   │                         Cursor-based pagination (nextPageToken)
+  │   │                         Fetches: summary, description, comments,
+  │   │                         status, type, priority, labels, components,
+  │   │                         fix versions, sprint, created, updated
+  │   └── confluence_client.py ← Confluence REST API v1 client
+  │                             Async, paginated (httpx)
+  │                             Storage-format HTML → plain text parser
+  │                             Fetches: title, body, space, labels, URL
+  │                             Page URLs normalised with /wiki/ prefix
+  │                             CQL search support for incremental sync
   │
   ├── ingest/
-  │   ├── __init__.py         ← Re-exports run_ingestion, run_jira_ingestion
+  │   ├── __init__.py         ← Re-exports run_ingestion, run_jira_ingestion,
+  │   │                         run_confluence_ingestion, sync helpers
   │   ├── ingest_docs.py      ← HTML doc ingestion pipeline
   │   │                         Web crawl (DOCS_URL) or local folder (DOCS_DIR)
   │   │                         deque.popleft() O(1) crawl queue
@@ -395,14 +423,22 @@ QUERY PHASE (runs every time you ask a question):
   │   │                         Comment indexing: each ticket comment is stored
   │   │                           as a separate Document prefixed with ticket header
   │   │                           (independently searchable, full context preserved)
+  │   ├── ingest_confluence.py ← Confluence ingestion pipeline
+  │   │                         ingest_confluence_async() — full re-index
+  │   │                         incremental_confluence_sync_async() — CQL lastModified
+  │   │                         smart_confluence_update_async() — SHA-256 hash diff
+  │   │                         Chunks at 800t / 150t overlap
+  │   │                         Stores: page_id, title, space_key, url, updated
   │   └── chunking.py         ← Token-aware RecursiveCharacterTextSplitter
   │                             1500 tokens / 300 token overlap (docs)
   │                             600 tokens / 100 token overlap (Jira)
+  │                             800 tokens / 150 token overlap (Confluence)
   │
   ├── rag/
   │   ├── __init__.py
   │   ├── retriever.py        ← Hybrid BM25 + vector search with reranker
-  │   │                         Searches both arcmind_docs and arcmind_jira
+  │   │                         Searches arcmind_docs, arcmind_jira AND
+  │   │                         arcmind_confluence via retrieve_all()
   │   │                         Jira filtered by connector/component if detected
   │   ├── query_expander.py   ← LLM-driven query expansion
   │   │                         ChatOpenAI singleton (_get_expansion_llm)
@@ -413,36 +449,47 @@ QUERY PHASE (runs every time you ask a question):
   │   ├── jira_clusterer.py   ← Groups Jira results into readable ticket summaries
   │   ├── reranker.py         ← Cross-encoder reranker wrapper
   │   │                         ms-marco-MiniLM-L-6-v2 (cached locally, ~22MB)
-  │   ├── prompt_builder.py   ← Assembles final GPT prompt with doc + jira context
+  │   ├── prompt_builder.py   ← Assembles final GPT prompt with three context blocks:
+  │   │                         1. Arc Documentation Context
+  │   │                         2. Confluence Wiki Context (page title + URL)
+  │   │                         3. Jira Issues Context (clustered tickets)
+  │   │                         build_confluence_context() — formats pages
   │   └── conversation_memory.py ← Server-side per-session conversation history
   │                               Keyed by session_id (max 128 chars, alphanumeric)
   │
   ├── vector_db/
   │   ├── __init__.py
-  │   └── chroma_store.py     ← Manages two ChromaDB collections:
-  │                             arcmind_docs  — documentation chunks
-  │                             arcmind_jira  — Jira ticket chunks
+  │   └── chroma_store.py     ← Manages THREE ChromaDB collections:
+  │                             arcmind_docs       — documentation chunks
+  │                             arcmind_jira       — Jira ticket chunks
+  │                             arcmind_confluence — Confluence page chunks
   │                             Plus companion BM25 Okapi pickle per collection
   │                             _safe_pickle_load path-validation (security)
-  │                             BM25 append mode for incremental Jira syncs
+  │                             BM25 append mode for incremental syncs
   │                             get_existing_docs_index() — {source_id: hash}
   │                             get_existing_jira_state() — {key: {hash, updated}}
-  │                             delete_jira_tickets() — removes chunks by ticket key
+  │                             get_existing_confluence_state() — {page_id: {hash}}
+  │                             delete_jira_tickets() / delete_confluence_pages()
   │
   ├── static/
   │   └── index.html          ← Full chat UI (HTML + CSS + JS, no frameworks)
-  │                             Live progress bar for BOTH docs and Jira indexing
+  │                             Live progress bar for docs, Jira AND Confluence
   │                             Polls /api/ingest/progress during any ingestion
-  │                             Status badge: docs: X, jira: Y vectors
+  │                             Status badge: docs: X, jira: Y, confluence: Z
+  │                             Toolbar buttons: Index/Update for each source
+  │                             Markdown [link](url) rendered as clickable links
   │                             Streaming chat via /api/chat/stream (SSE)
   │
   ├── logs/
   │   └── query_log.jsonl     ← Auto-created JSONL query log
   │                             Fields: ts, question, expanded_queries,
-  │                             docs_retrieved, jira_retrieved, answer_preview
+  │                             docs_retrieved, jira_retrieved,
+  │                             confluence_retrieved, answer_preview
   │
   ├── chroma_db/              ← Auto-created after first indexing
-  │                             SQLite + BM25 pickles (bm25_docs.pkl, bm25_jira.pkl)
+  │                             SQLite + BM25 pickles:
+  │                             bm25_docs.pkl, bm25_jira.pkl,
+  │                             bm25_confluence.pkl
   │                             Persisted as Docker volume chroma_data
   │
   ├── Dockerfile              ← Two-stage build (builder + lean runtime)
@@ -497,6 +544,8 @@ QUERY PHASE (runs every time you ask a question):
 │                       │ stores document vectors as a SQLite file,           │
 │                       │ supports fast similarity search over millions        │
 │                       │ of vectors, free to use.                            │
+│                       │ Three collections: arcmind_docs, arcmind_jira,      │
+│                       │ arcmind_confluence.                                 │
 ├───────────────────────┼──────────────────────────────────────────────────────┤
 │ langchain-community   │ Community retrievers and HuggingFace cross-encoder  │
 │                       │ integration. Provides HuggingFaceCrossEncoder.      │
@@ -553,10 +602,15 @@ QUERY PHASE (runs every time you ask a question):
 │                       │ Uses cursor pagination (nextPageToken) to fetch     │
 │                       │ ALL issues regardless of project size.              │
 ├───────────────────────┼──────────────────────────────────────────────────────┤
-│ requests              │ Standard Python HTTP client library.                │
-│                       │ Why: Used by the web crawler (ingest_docs.py) and   │
-│                       │ the Jira client (jira_client.py). Handles timeouts, │
-│                       │ redirects, auth, and Content-Type checking.         │
+│ Confluence REST API v1│ Atlassian API for fetching Confluence wiki pages.   │
+│                       │ Fetches pages by space key or CQL query.            │
+│                       │ Storage-format HTML parsed to plain text.           │
+│                       │ Page URLs normalised with /wiki/ prefix.            │
+│                       │ Uses same API token as Jira (one Atlassian account).│
+├───────────────────────┼──────────────────────────────────────────────────────┤
+│ httpx                 │ Async HTTP client library.                          │
+│                       │ Why: Used by jira_client.py and confluence_client.py│
+│                       │ for async/await API calls with connection pooling.  │
 ├───────────────────────┼──────────────────────────────────────────────────────┤
 │ Docker / Podman       │ Container runtime for packaging and deploying the   │
 │                       │ application. Dockerfile defines the image build.    │
@@ -576,11 +630,12 @@ QUERY PHASE (runs every time you ask a question):
   ║   ┌──────────────────────────────────────────────────────────────────┐   ║
   ║   │                  static/index.html (Chat UI)                     │   ║
   ║   │                                                                  │   ║
-  ║   │  [⚡ Index Docs] [🔗 Index Jira]  ✓ Ready — 20,479 vectors      │   ║
-  ║   │                  (docs: 2809, jira: 17670)                       │   ║
+  ║   │  [⚡ Index Docs] [� Update Docs] [🔗 Index Jira] [🔄 Update Jira] │   ║
+  ║   │  [📄 Index Confluence]  [🔄 Update Confluence]                    │   ║
+  ║   │  ✓ Ready — docs: 2809, jira: 17670, confluence: 4521             │   ║
   ║   │  ─────────────────────────────────────────────────────────────   │   ║
-  ║   │   AI: To configure SFTP, navigate to the connector settings...   │   ║
-  ║   │       📄 Sources: SFTP.html  •  ARC-1234, ARC-5678              │   ║
+  ║   │   AI: To configure SFTP ... [Cleanup Guide](https://...wiki/...) │   ║
+  ║   │       📄 Sources: SFTP.html • ARC-1234 • Cleanup Options in Arc  │   ║
   ║   │  ─────────────────────────────────────────────────────────────   │   ║
   ║   │   [Type your question here...                          ] [Send]  │   ║
   ║   └──────────┬──────────────────┬──────────────────────────────────  ┘   ║
@@ -592,16 +647,20 @@ QUERY PHASE (runs every time you ask a question):
   ╔══════════════════════════════════════════════════════════════════════════╗
   ║                     FASTAPI BACKEND  (main.py)                          ║
   ║                                                                          ║
-  ║   GET  /                       →  serves static/index.html              ║
-  ║   GET  /api/status             →  docs_vectors, jira_vectors, total     ║
-  ║   POST /api/ingest             →  ingest_docs_async() (full re-index)   ║
-  ║   POST /api/ingest/update      →  smart_docs_update() (SHA-256 diff)    ║
-  ║   POST /api/ingest/jira        →  ingest_jira_async() (full re-index)   ║
-  ║   POST /api/ingest/jira/update →  smart_jira_update_async() (hash diff) ║
-  ║   POST /api/ingest/jira/sync   →  incremental_jira_sync_async()         ║
-  ║   GET  /api/ingest/progress    →  live chunks_done / chunks_total       ║
-  ║   POST /api/chat               →  rag_engine.ask() (blocking)           ║
-  ║   POST /api/chat/stream        →  rag_engine.ask_stream() (SSE)         ║
+  ║   GET  /                          →  serves static/index.html              ║
+  ║   GET  /api/status                →  docs_vectors, jira_vectors,           ║
+  ║                                       confluence_vectors, total            ║
+  ║   POST /api/ingest                →  ingest_docs_async() (full re-index)   ║
+  ║   POST /api/ingest/update         →  smart_docs_update() (SHA-256 diff)    ║
+  ║   POST /api/ingest/jira           →  ingest_jira_async() (full re-index)   ║
+  ║   POST /api/ingest/jira/update    →  smart_jira_update_async() (hash diff) ║
+  ║   POST /api/ingest/jira/sync      →  incremental_jira_sync_async()         ║
+  ║   POST /api/ingest/confluence     →  ingest_confluence_async() (full)      ║
+  ║   POST /api/ingest/confluence/update → smart_confluence_update_async()     ║
+  ║   POST /api/ingest/confluence/sync   → incremental_confluence_sync_async() ║
+  ║   GET  /api/ingest/progress       →  live chunks_done / chunks_total       ║
+  ║   POST /api/chat                  →  rag_engine.ask() (blocking)           ║
+  ║   POST /api/chat/stream           →  rag_engine.ask_stream() (SSE)         ║
   ║                                                                          ║
   ║   Security: asyncio.Lock guards ingest endpoints (no race conditions)   ║
   ║   Auth:     X-API-Key middleware (when API_KEY env var is set)          ║
@@ -619,23 +678,27 @@ QUERY PHASE (runs every time you ask a question):
   ║ MAX_CRAWL_PAGES cap  ║  ║ nextPageToken          ║  ║    docs/jira/hybrid  ║
   ║ BeautifulSoup        ║  ║ → ALL issues           ║  ║                      ║
   ║ strip noise          ║  ║                        ║  ║ 2. query_expander    ║
-  ║ → chunk 1500t        ║  ║ ingest/                ║  ║    → 5 variants      ║
-  ║ → embed              ║  ║ ingest_jira.py         ║  ║                      ║
-  ║ → arcmind_docs       ║  ║ full OR incremental    ║  ║ 3. retriever.py      ║
-  ║ → bm25_docs.pkl      ║  ║ format text            ║  ║    BM25 (keyword)    ║
-  ║ progress → UI bar    ║  ║ → chunk 1500t          ║  ║    + vector search   ║
-  ║                      ║  ║ → embed                ║  ║    merge + dedup     ║
-  ╚══════════════════════╝  ║ → arcmind_jira         ║  ║    reranker.py       ║
-                            ║ → bm25_jira.pkl        ║  ║    cross-encoder     ║
-                            ║ BM25 append mode       ║  ║                      ║
-                            ╚════════════╤═══════════╝  ║ 4. prompt_builder    ║
-                                         │              ║    doc chunks +      ║
-                                         │              ║    jira cluster      ║
-                                         │              ║    → GPT-4.1 prompt  ║
-                                         │              ║                      ║
-                                         │              ║ 5. gpt-4.1           ║
-                                         │              ║    → answer+sources  ║
-                                         │              ╚══════════╤═══════════╝
+  ║ → chunk 1500t        ║  ║ confluence_client.py   ║  ║    → 5 variants      ║
+  ║ → embed              ║  ║ GET /content (CQL)     ║  ║                      ║
+  ║ → arcmind_docs       ║  ║ (Confluence REST v1)   ║  ║ 3. retriever.py      ║
+  ║ → bm25_docs.pkl      ║  ║ storage HTML → text    ║  ║    BM25 + vector     ║
+  ║ progress → UI bar    ║  ║ /wiki/ URL fix         ║  ║    DOCS+JIRA+        ║
+  ║                      ║  ║                        ║  ║    CONFLUENCE        ║
+  ╚══════════════════════╝  ║ ingest/                ║  ║    reranker.py       ║
+                            ║ ingest_jira.py         ║  ║    cross-encoder     ║
+                            ║ full OR incremental    ║  ║                      ║
+                            ║ → chunk 600t           ║  ║ 4. prompt_builder    ║
+                            ║ → embed                ║  ║    doc chunks +      ║
+                            ║ → arcmind_jira         ║  ║    confluence pages +║
+                            ║ → bm25_jira.pkl        ║  ║    jira cluster      ║
+                            ║                        ║  ║    → GPT-4.1 prompt  ║
+                            ║ ingest_confluence.py   ║  ║                      ║
+                            ║ full OR CQL sync       ║  ║ 5. gpt-4.1           ║
+                            ║ → chunk 800t           ║  ║    → answer+sources  ║
+                            ║ → embed                ║  ╚══════════╤═══════════╝
+                            ║ → arcmind_confluence   ║             │
+                            ║ → bm25_confluence.pkl  ║             │
+                            ╚════════════╤═══════════╝             │
                                          │                         │
                                          ▼                         ▼
   ╔══════════════════════════════════════════════════════════════════════════╗
@@ -646,6 +709,11 @@ QUERY PHASE (runs every time you ask a question):
   ║  │ ~2,800 vectors                │  │ ~17,000 – 40,000 vectors       │  ║
   ║  │ + bm25_docs.pkl               │  │ + bm25_jira.pkl                │  ║
   ║  └───────────────────────────────┘  └────────────────────────────────┘  ║
+  ║  ┌───────────────────────────────────────────────────────────────────┐  ║
+  ║  │ collection: arcmind_confluence                                    │  ║
+  ║  │ wiki pages from configured Confluence spaces                      │  ║
+  ║  │ + bm25_confluence.pkl                                             │  ║
+  ║  └───────────────────────────────────────────────────────────────────┘  ║
   ║  Stored at CHROMA_DB_DIR  (./chroma_db  or  /app/chroma_db in Docker)   ║
   ╚══════════════════════════════════════════════════════════════════════════╝
                                 │                    │
@@ -855,6 +923,7 @@ LangChain components used:
   ✓ ALWAYS UP TO DATE
     Click ⚡ Index Docs whenever you update your HTML files.
     Use Incremental Jira Sync to pull only the latest tickets (last N hours).
+    Use Update Confluence to sync changed Confluence pages via SHA-256 diff.
     The index rebuilds in minutes with the latest content.
 
   ✓ COST EFFECTIVE
@@ -950,8 +1019,24 @@ LangChain components used:
                                                id.atlassian.com → Security →
                                                API tokens
 
-  JIRA_PROJECT_KEY   (required for Jira)       Jira project key to index.
-                                               e.g. ARCESB, ARC, SUPPORT
+  CONFLUENCE_URL           (required for         Your Atlassian Cloud base URL.
+                            Confluence)           Same as JIRA_URL.
+
+  CONFLUENCE_EMAIL          (required for         Same email as Jira.
+                            Confluence)
+
+  CONFLUENCE_API_TOKEN      (required for         Same API token as Jira.
+                            Confluence)           One token per Atlassian account
+                                                  works across all Atlassian
+                                                  products.
+
+  CONFLUENCE_SPACES         (required for         Comma-separated space keys.
+                            Confluence)           e.g. DOCS,KB,SUPPORT
+
+  CONFLUENCE_PAGE_SIZE      100                   Pages per API request (max 250).
+
+  CONFLUENCE_TOP_K          4                     Confluence page chunks passed
+                                                  to GPT after reranking.
 
 
 ════════════════════════════════════════════════════════════════════════════════

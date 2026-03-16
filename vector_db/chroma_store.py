@@ -39,11 +39,13 @@ OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY",   "")
 EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL",  "text-embedding-3-large")
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "100"))
 
-DOCS_COLLECTION  = "arcmind_docs"
-JIRA_COLLECTION  = "arcmind_jira"
+DOCS_COLLECTION        = "arcmind_docs"
+JIRA_COLLECTION        = "arcmind_jira"
+CONFLUENCE_COLLECTION  = "arcmind_confluence"
 
-_BM25_DOCS_PKL   = os.path.join(CHROMA_DB_DIR, "bm25_docs.pkl")
-_BM25_JIRA_PKL   = os.path.join(CHROMA_DB_DIR, "bm25_jira.pkl")
+_BM25_DOCS_PKL        = os.path.join(CHROMA_DB_DIR, "bm25_docs.pkl")
+_BM25_JIRA_PKL        = os.path.join(CHROMA_DB_DIR, "bm25_jira.pkl")
+_BM25_CONFLUENCE_PKL  = os.path.join(CHROMA_DB_DIR, "bm25_confluence.pkl")
 
 
 # ---------------------------------------------------------------------------
@@ -54,14 +56,17 @@ class ChromaStore:
     """Manages two ChromaDB collections and their companion BM25 indexes."""
 
     def __init__(self) -> None:
-        self._embeddings:  OpenAIEmbeddings | None = None
-        self._docs_store:  Chroma | None = None
-        self._jira_store:  Chroma | None = None
+        self._embeddings:        OpenAIEmbeddings | None = None
+        self._docs_store:        Chroma | None = None
+        self._jira_store:        Chroma | None = None
+        self._confluence_store:  Chroma | None = None
         # BM25 — loaded lazily from disk
-        self._bm25_docs:   Any = None
-        self._bm25_jira:   Any = None
-        self._corpus_docs: list[tuple[str, str, dict]] = []   # (chroma_id, text, metadata)
-        self._corpus_jira: list[tuple[str, str, dict]] = []
+        self._bm25_docs:        Any = None
+        self._bm25_jira:        Any = None
+        self._bm25_confluence:  Any = None
+        self._corpus_docs:      list[tuple[str, str, dict]] = []   # (chroma_id, text, metadata)
+        self._corpus_jira:      list[tuple[str, str, dict]] = []
+        self._corpus_confluence: list[tuple[str, str, dict]] = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -85,7 +90,7 @@ class ChromaStore:
                     embedding_function=self._get_embeddings(),
                 )
             return self._docs_store
-        else:
+        elif collection == JIRA_COLLECTION:
             if self._jira_store is None:
                 self._jira_store = Chroma(
                     collection_name=JIRA_COLLECTION,
@@ -93,6 +98,14 @@ class ChromaStore:
                     embedding_function=self._get_embeddings(),
                 )
             return self._jira_store
+        else:  # CONFLUENCE_COLLECTION
+            if self._confluence_store is None:
+                self._confluence_store = Chroma(
+                    collection_name=CONFLUENCE_COLLECTION,
+                    persist_directory=CHROMA_DB_DIR,
+                    embedding_function=self._get_embeddings(),
+                )
+            return self._confluence_store
 
     def _reset_collection(self, collection_name: str) -> None:
         """Drop and recreate a ChromaDB collection."""
@@ -100,9 +113,12 @@ class ChromaStore:
         if collection_name == DOCS_COLLECTION:
             self._docs_store = None
             bm25_path = _BM25_DOCS_PKL
-        else:
+        elif collection_name == JIRA_COLLECTION:
             self._jira_store = None
             bm25_path = _BM25_JIRA_PKL
+        else:  # CONFLUENCE_COLLECTION
+            self._confluence_store = None
+            bm25_path = _BM25_CONFLUENCE_PKL
 
         gc.collect()
         _clear_chroma_cache()
@@ -171,9 +187,20 @@ class ChromaStore:
             log.warning("rank_bm25 not installed — BM25 indexing skipped.")
             return
 
-        pkl_path      = _BM25_DOCS_PKL if collection_name == DOCS_COLLECTION else _BM25_JIRA_PKL
+        if collection_name == DOCS_COLLECTION:
+            pkl_path = _BM25_DOCS_PKL
+        elif collection_name == JIRA_COLLECTION:
+            pkl_path = _BM25_JIRA_PKL
+        else:
+            pkl_path = _BM25_CONFLUENCE_PKL
         is_docs       = (collection_name == DOCS_COLLECTION)
-        cached_corpus = self._corpus_docs if is_docs else self._corpus_jira
+        is_confluence = (collection_name == CONFLUENCE_COLLECTION)
+        if is_docs:
+            cached_corpus = self._corpus_docs
+        elif is_confluence:
+            cached_corpus = self._corpus_confluence
+        else:
+            cached_corpus = self._corpus_jira
 
         try:
             if new_docs is not None and cached_corpus:
@@ -206,6 +233,9 @@ class ChromaStore:
             if is_docs:
                 self._bm25_docs   = bm25
                 self._corpus_docs = corpus
+            elif is_confluence:
+                self._bm25_confluence   = bm25
+                self._corpus_confluence = corpus
             else:
                 self._bm25_jira   = bm25
                 self._corpus_jira = corpus
@@ -223,10 +253,14 @@ class ChromaStore:
             if self._bm25_docs is not None:
                 return self._bm25_docs, self._corpus_docs
             pkl_path = _BM25_DOCS_PKL
-        else:
+        elif collection_name == JIRA_COLLECTION:
             if self._bm25_jira is not None:
                 return self._bm25_jira, self._corpus_jira
             pkl_path = _BM25_JIRA_PKL
+        else:  # CONFLUENCE_COLLECTION
+            if self._bm25_confluence is not None:
+                return self._bm25_confluence, self._corpus_confluence
+            pkl_path = _BM25_CONFLUENCE_PKL
 
         if not os.path.exists(pkl_path):
             return None, []
@@ -239,6 +273,9 @@ class ChromaStore:
             if collection_name == DOCS_COLLECTION:
                 self._bm25_docs   = bm25
                 self._corpus_docs = corpus
+            elif collection_name == CONFLUENCE_COLLECTION:
+                self._bm25_confluence   = bm25
+                self._corpus_confluence = corpus
             else:
                 self._bm25_jira   = bm25
                 self._corpus_jira = corpus
@@ -290,6 +327,24 @@ class ChromaStore:
         self._build_bm25(JIRA_COLLECTION, new_docs=None if reset else chunks)
         return count
 
+    def add_confluence_batch(
+        self,
+        chunks: list[Document],
+        reset: bool = False,
+        on_progress: Any = None,
+    ) -> int:
+        """Embed and store Confluence chunks.  Returns new collection count."""
+        if reset:
+            self._reset_collection(CONFLUENCE_COLLECTION)
+
+        store = self._get_store(CONFLUENCE_COLLECTION)
+        self._add_in_batches(store, chunks, EMBED_BATCH_SIZE, on_progress=on_progress)
+        count = store._collection.count()
+        log.info("Confluence collection: %d vectors.", count)
+
+        self._build_bm25(CONFLUENCE_COLLECTION, new_docs=None if reset else chunks)
+        return count
+
     # ------------------------------------------------------------------
     # Public read API
     # ------------------------------------------------------------------
@@ -328,6 +383,23 @@ class ChromaStore:
             log.error("Jira vector search failed: %s", exc)
             return []
 
+    def similarity_search_confluence(
+        self,
+        query: str,
+        k: int = 4,
+        filter_metadata: dict | None = None,
+    ) -> list[Document]:
+        """Cosine-similarity search in the Confluence collection."""
+        store  = self._get_store(CONFLUENCE_COLLECTION)
+        kwargs: dict = {"k": k}
+        if filter_metadata:
+            kwargs["filter"] = filter_metadata
+        try:
+            return store.similarity_search(query, **kwargs)
+        except Exception as exc:
+            log.error("Confluence vector search failed: %s", exc)
+            return []
+
     def bm25_search(
         self,
         query: str,
@@ -335,7 +407,12 @@ class ChromaStore:
         k: int = 10,
     ) -> list[Document]:
         """BM25 keyword search.  Returns top-*k* documents."""
-        col_name = DOCS_COLLECTION if collection == "docs" else JIRA_COLLECTION
+        if collection == "docs":
+            col_name = DOCS_COLLECTION
+        elif collection == "confluence":
+            col_name = CONFLUENCE_COLLECTION
+        else:
+            col_name = JIRA_COLLECTION
         bm25, corpus = self._load_bm25(col_name)
         if bm25 is None or not corpus:
             return []
@@ -401,6 +478,12 @@ class ChromaStore:
         except Exception:
             return False
 
+    def is_confluence_ready(self) -> bool:
+        try:
+            return self._get_store(CONFLUENCE_COLLECTION)._collection.count() > 0
+        except Exception:
+            return False
+
     def docs_count(self) -> int:
         try:
             return self._get_store(DOCS_COLLECTION)._collection.count()
@@ -410,6 +493,12 @@ class ChromaStore:
     def jira_count(self) -> int:
         try:
             return self._get_store(JIRA_COLLECTION)._collection.count()
+        except Exception:
+            return 0
+
+    def confluence_count(self) -> int:
+        try:
+            return self._get_store(CONFLUENCE_COLLECTION)._collection.count()
         except Exception:
             return 0
 
@@ -478,6 +567,59 @@ class ChromaStore:
             except Exception as exc:
                 log.warning("Could not delete ticket %s: %s", key, exc)
 
+    def get_existing_confluence_state(self) -> dict[str, dict]:
+        """
+        Return {page_id: {"updated": timestamp, "hash": content_hash}}
+        for every page currently stored in the Confluence collection.
+        """
+        store      = self._get_store(CONFLUENCE_COLLECTION)
+        result:    dict[str, dict] = {}
+        batch_size = 5000
+        offset     = 0
+        try:
+            while True:
+                raw   = store._collection.get(
+                    include=["metadatas"],
+                    limit=batch_size,
+                    offset=offset,
+                )
+                metas = raw.get("metadatas") or []
+                if not metas:
+                    break
+                for meta in metas:
+                    if not meta:
+                        continue
+                    pid     = meta.get("page_id", "")
+                    updated = meta.get("updated", "") or ""
+                    chash   = meta.get("content_hash", "") or ""
+                    if not pid:
+                        continue
+                    if pid not in result or updated > result[pid]["updated"]:
+                        result[pid] = {"updated": updated, "hash": chash}
+                if len(metas) < batch_size:
+                    break
+                offset += batch_size
+            log.info(
+                "Confluence index snapshot: %d unique pages read from ChromaDB.",
+                len(result),
+            )
+            return result
+        except Exception as exc:
+            log.error("Failed to read existing Confluence state: %s", exc)
+            return {}
+
+    def delete_confluence_pages(self, page_ids: list[str]) -> None:
+        """Delete ALL ChromaDB chunks for the given Confluence page IDs."""
+        if not page_ids:
+            return
+        store = self._get_store(CONFLUENCE_COLLECTION)
+        for pid in page_ids:
+            try:
+                store._collection.delete(where={"page_id": pid})
+                log.debug("Deleted chunks for Confluence page %s.", pid)
+            except Exception as exc:
+                log.warning("Could not delete Confluence page %s: %s", pid, exc)
+
     def get_existing_docs_index(self) -> dict[str, str]:
         """
         Return {source_id: content_hash} for every document chunk currently
@@ -530,8 +672,9 @@ class ChromaStore:
 
     def release(self) -> None:
         """Free all ChromaDB handles (important on Windows to release SQLite locks)."""
-        self._docs_store = None
-        self._jira_store = None
+        self._docs_store       = None
+        self._jira_store       = None
+        self._confluence_store = None
         gc.collect()
         _clear_chroma_cache()
 

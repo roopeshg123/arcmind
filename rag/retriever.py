@@ -103,6 +103,8 @@ def hybrid_search(
         # Vector search
         if collection == "docs":
             vec = store.similarity_search_docs(query, k=per_query_k, filter_metadata=filter_meta)
+        elif collection == "confluence":
+            vec = store.similarity_search_confluence(query, k=per_query_k, filter_metadata=filter_meta)
         else:
             vec = store.similarity_search_jira(query, k=per_query_k, filter_metadata=filter_meta)
 
@@ -144,3 +146,28 @@ def retrieve_docs_and_jira(
         queries, collection="jira", k=jira_k, connector_filter=connector_filter
     )
     return docs_results, jira_results
+
+
+def retrieve_all(
+    queries:          list[str],
+    docs_k:           int = 6,
+    jira_k:           int = 4,
+    confluence_k:     int = 4,
+    connector_filter: str | None = None,
+) -> tuple[list[Document], list[Document], list[Document]]:
+    """
+    Retrieve from docs, Jira, and Confluence collections simultaneously.
+
+    Returns:
+        (docs_results, jira_results, confluence_results)
+    """
+    docs_results       = hybrid_search(
+        queries, collection="docs", k=docs_k, connector_filter=connector_filter
+    )
+    jira_results       = hybrid_search(
+        queries, collection="jira", k=jira_k, connector_filter=connector_filter
+    )
+    confluence_results = hybrid_search(
+        queries, collection="confluence", k=confluence_k, connector_filter=connector_filter
+    )
+    return docs_results, jira_results, confluence_results

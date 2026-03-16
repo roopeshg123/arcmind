@@ -42,7 +42,7 @@ from rag.prompt_builder      import build_messages
 from rag.query_expander      import expand_query
 from rag.query_router        import route_query
 from rag.reranker            import rerank, warmup
-from rag.retriever           import retrieve_docs_and_jira
+from rag.retriever           import retrieve_docs_and_jira, retrieve_all
 from vector_db.chroma_store  import get_store, reset_store
 
 load_dotenv()
@@ -62,8 +62,9 @@ os.makedirs(LOG_DIR, exist_ok=True)
 _QUERY_LOG = os.path.join(LOG_DIR, "query_log.jsonl")
 
 # Result-count tunables (env-configurable)
-_DOCS_TOP_K = int(os.getenv("DOCS_TOP_K", "6"))
-_JIRA_TOP_K = int(os.getenv("JIRA_TOP_K", "4"))
+_DOCS_TOP_K       = int(os.getenv("DOCS_TOP_K",       "6"))
+_JIRA_TOP_K       = int(os.getenv("JIRA_TOP_K",       "4"))
+_CONFLUENCE_TOP_K = int(os.getenv("CONFLUENCE_TOP_K", "4"))
 
 # LLM singletons — created once per process to avoid per-request re-instantiation
 _llm:           ChatOpenAI | None = None
@@ -100,7 +101,7 @@ class _CollectionProxy:
         self._store = store
 
     def count(self) -> int:
-        return self._store.docs_count() + self._store.jira_count()
+        return self._store.docs_count() + self._store.jira_count() + self._store.confluence_count()
 
 
 class _StoreProxy:
@@ -156,16 +157,18 @@ def _log_query(
     n_docs:          int,
     n_jira:          int,
     answer_preview:  str,
+    n_confluence:    int = 0,
 ) -> None:
     """Append a structured query record to the JSONL log file."""
     try:
         entry = {
-            "ts":              time.time(),
-            "question":        question,
+            "ts":               time.time(),
+            "question":         question,
             "expanded_queries": expanded,
-            "docs_retrieved":  n_docs,
-            "jira_retrieved":  n_jira,
-            "answer_preview":  answer_preview[:500],
+            "docs_retrieved":   n_docs,
+            "jira_retrieved":   n_jira,
+            "confluence_retrieved": n_confluence,
+            "answer_preview":   answer_preview[:500],
         }
         with open(_QUERY_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
@@ -214,12 +217,12 @@ def _run_pipeline(
     question:     str,
     session_id:   str | None,
     chat_history: list[dict],
-) -> tuple[list, list, list[str], list[dict]]:
+) -> tuple[list, list, list, list[str], list[dict]]:
     """
     Execute routing → connector detection → expansion → hybrid retrieval → rerank.
 
     Returns:
-        (docs, jira_docs, expanded_queries, effective_chat_history)
+        (docs, jira_docs, confluence_docs, expanded_queries, effective_chat_history)
     """
     # Merge server-side memory with any client-provided history
     if session_id:
@@ -243,34 +246,42 @@ def _run_pipeline(
     # 4. Retrieve
     if route.strategy == "ticket_direct" and route.ticket_ids:
         log.info("Direct ticket fetch: %s", route.ticket_ids)
-        jira_docs     = get_store().get_jira_by_tickets(route.ticket_ids)
-        docs, _       = retrieve_docs_and_jira(
-            [question], docs_k=_DOCS_TOP_K, jira_k=0, connector_filter=connector
+        jira_docs       = get_store().get_jira_by_tickets(route.ticket_ids)
+        docs, _, conf   = retrieve_all(
+            [question],
+            docs_k=_DOCS_TOP_K, jira_k=0, confluence_k=_CONFLUENCE_TOP_K,
+            connector_filter=connector,
         )
+        confluence_docs = conf
     else:
-        docs, jira_docs = retrieve_docs_and_jira(
-            expanded, docs_k=_DOCS_TOP_K, jira_k=_JIRA_TOP_K, connector_filter=connector
+        docs, jira_docs, confluence_docs = retrieve_all(
+            expanded,
+            docs_k=_DOCS_TOP_K, jira_k=_JIRA_TOP_K, confluence_k=_CONFLUENCE_TOP_K,
+            connector_filter=connector,
         )
 
     # 5. Rerank combined pool (keep source split afterwards)
-    combined = docs + jira_docs
+    combined = docs + jira_docs + confluence_docs
     if combined:
-        reranked  = rerank(question, combined, top_n=_DOCS_TOP_K + _JIRA_TOP_K)
-        docs      = [d for d in reranked if d.metadata.get("source") != "jira"][:_DOCS_TOP_K]
-        jira_docs = [d for d in reranked if d.metadata.get("source") == "jira"][:_JIRA_TOP_K]
+        total_top_n = _DOCS_TOP_K + _JIRA_TOP_K + _CONFLUENCE_TOP_K
+        reranked  = rerank(question, combined, top_n=total_top_n)
+        docs            = [d for d in reranked if d.metadata.get("source") not in ("jira", "confluence")][:_DOCS_TOP_K]
+        jira_docs       = [d for d in reranked if d.metadata.get("source") == "jira"][:_JIRA_TOP_K]
+        confluence_docs = [d for d in reranked if d.metadata.get("source") == "confluence"][:_CONFLUENCE_TOP_K]
 
-    return docs, jira_docs, expanded, chat_history
+    return docs, jira_docs, confluence_docs, expanded, chat_history
 
 
-def _build_sources(docs: list, jira_docs: list) -> list[dict]:
+def _build_sources(docs: list, jira_docs: list, confluence_docs: list | None = None) -> list[dict]:
     """Build the deduplicated sources list returned to the client."""
     seen: set[str] = set()
     sources: list[dict] = []
-    for doc in docs + jira_docs:
+    for doc in docs + jira_docs + (confluence_docs or []):
         key = (
             doc.metadata.get("file_path")
             or doc.metadata.get("url")
             or doc.metadata.get("ticket")
+            or doc.metadata.get("page_id")
             or "unknown"
         )
         if key not in seen:
@@ -280,6 +291,7 @@ def _build_sources(docs: list, jira_docs: list) -> list[dict]:
                 "type":    doc.metadata.get("source",    "unknown"),
                 "section": doc.metadata.get("section",   ""),
                 "ticket":  doc.metadata.get("ticket",    ""),
+                "title":   doc.metadata.get("title",     ""),
                 "content": doc.page_content[:300] + (
                     "..." if len(doc.page_content) > 300 else ""
                 ),
@@ -316,11 +328,11 @@ def ask(
 
     question = _normalize_question(question)
 
-    docs, jira_docs, expanded, history = _run_pipeline(
+    docs, jira_docs, confluence_docs, expanded, history = _run_pipeline(
         question, session_id=session_id, chat_history=chat_history
     )
 
-    messages = build_messages(question, docs, jira_docs, history)
+    messages = build_messages(question, docs, jira_docs, history, confluence_docs=confluence_docs)
 
     llm = _get_llm()
 
@@ -335,7 +347,7 @@ def ask(
     if session_id:
         get_memory().add_turn(session_id, question, answer)
 
-    _log_query(question, expanded, len(docs), len(jira_docs), answer)
+    _log_query(question, expanded, len(docs), len(jira_docs), answer, n_confluence=len(confluence_docs))
 
     jira_issues = [
         {
@@ -348,7 +360,7 @@ def ask(
 
     return {
         "answer":      answer,
-        "sources":     _build_sources(docs, jira_docs),
+        "sources":     _build_sources(docs, jira_docs, confluence_docs),
         "jira_issues": jira_issues,
     }
 
@@ -381,14 +393,14 @@ async def ask_stream(
     question = _normalize_question(question)
 
     loop = asyncio.get_event_loop()
-    docs, jira_docs, expanded, history = await loop.run_in_executor(
+    docs, jira_docs, confluence_docs, expanded, history = await loop.run_in_executor(
         None,
         functools.partial(
             _run_pipeline, question, session_id=session_id, chat_history=chat_history
         ),
     )
 
-    messages = build_messages(question, docs, jira_docs, history)
+    messages = build_messages(question, docs, jira_docs, history, confluence_docs=confluence_docs)
 
     llm = _get_llm(streaming=True)
 
@@ -409,7 +421,7 @@ async def ask_stream(
     if session_id:
         get_memory().add_turn(session_id, question, answer)
 
-    _log_query(question, expanded, len(docs), len(jira_docs), answer)
+    _log_query(question, expanded, len(docs), len(jira_docs), answer, n_confluence=len(confluence_docs))
 
     jira_issues = [
         {
@@ -420,4 +432,4 @@ async def ask_stream(
         for d in jira_docs if d.metadata.get("ticket")
     ]
 
-    yield f"data: {json.dumps({'done': True, 'sources': _build_sources(docs, jira_docs), 'jira_issues': jira_issues})}\n\n"
+    yield f"data: {json.dumps({'done': True, 'sources': _build_sources(docs, jira_docs, confluence_docs), 'jira_issues': jira_issues})}\n\n"
