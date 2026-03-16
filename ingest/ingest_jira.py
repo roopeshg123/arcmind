@@ -96,6 +96,15 @@ def _format_ticket_text(issue: dict) -> str:
     if issue.get("description"):
         lines.extend(["", "Description:", _s(issue["description"])[:3000]])
 
+    # Linked Jira issues (blocks, is blocked by, relates to, sub-task of, etc.)
+    linked = issue.get("linked_issues") or []
+    if linked:
+        lines.append("")
+        lines.append("Linked Issues:")
+        for li in linked:
+            status_str = f" [{_s(li.get('status'))}]" if li.get("status") else ""
+            lines.append(f"  - {_s(li.get('type'))}: {_s(li.get('key'))}{status_str} — {_s(li.get('summary'))}")
+
     # Comments are indexed as separate documents; omit them from the main body
     # to avoid diluting the description chunk's semantic focus.
 

@@ -130,18 +130,10 @@ def format_jira_clusters(clusters: dict[str, list[Document]]) -> str:
                 # Include full comment content so the LLM can read it
                 lines.append(f"- **{ticket}**{status_tag} (comment):\n{doc.page_content.strip()}")
             else:
-                # Use stored summary metadata first; fall back to content parsing
-                summary = doc.metadata.get("summary", "")
-                if not summary:
-                    skip_keys = {"Ticket:", "Type:", "Status:", "Priority:",
-                                 "Resolution:", "Components:", "Labels:", "Summary:",
-                                 "Description:", "Comments:"}
-                    for line in doc.page_content.splitlines():
-                        stripped = line.strip()
-                        if stripped and not any(stripped.startswith(k) for k in skip_keys):
-                            summary = stripped[:120]
-                            break
-                lines.append(f"- **{ticket}**{status_tag}: {summary[:120]}")
+                # Include FULL ticket content (description + metadata) so the LLM
+                # can read XML examples, workarounds, and proposed solutions.
+                # The description is already capped at 3000 chars during ingest.
+                lines.append(f"#### {ticket}{status_tag}\n{doc.page_content.strip()}")
         lines.append("")   # blank line between clusters
 
     return "\n".join(lines).strip()

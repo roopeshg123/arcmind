@@ -101,22 +101,44 @@ def _format_issue(issue: dict) -> dict:
     elif isinstance(sprint_raw, str):
         sprint = sprint_raw
 
+    # Linked Jira issues (blocks, is blocked by, relates to, etc.)
+    linked_issues: list[dict] = []
+    for link in (fields.get("issuelinks") or []):
+        link_type = (link.get("type") or {}).get("name", "relates to")
+        if "inwardIssue" in link:
+            li = link["inwardIssue"]
+            linked_issues.append({
+                "type":      (link.get("type") or {}).get("inward", link_type),
+                "key":       li.get("key", ""),
+                "summary":   ((li.get("fields") or {}).get("summary") or ""),
+                "status":    ((li.get("fields") or {}).get("status") or {}).get("name", ""),
+            })
+        if "outwardIssue" in link:
+            lo = link["outwardIssue"]
+            linked_issues.append({
+                "type":      (link.get("type") or {}).get("outward", link_type),
+                "key":       lo.get("key", ""),
+                "summary":   ((lo.get("fields") or {}).get("summary") or ""),
+                "status":    ((lo.get("fields") or {}).get("status") or {}).get("name", ""),
+            })
+
     return {
-        "key":          issue.get("key", ""),
-        "summary":      fields.get("summary", ""),
-        "description":  description,
-        "comments":     "\n".join(comment_list),
+        "key":           issue.get("key", ""),
+        "summary":       fields.get("summary", ""),
+        "description":   description,
+        "comments":      "\n".join(comment_list),
         "comment_items": comment_items,
-        "labels":       labels,
-        "components":   components,
-        "status":       (fields.get("status") or {}).get("name", ""),
-        "issue_type":   (fields.get("issuetype") or {}).get("name", ""),
-        "priority":     (fields.get("priority") or {}).get("name", ""),
-        "resolution":   resolution,
-        "fix_versions": fix_versions,
-        "sprint":       sprint,
-        "created":      fields.get("created", ""),
-        "updated":      fields.get("updated", ""),
+        "linked_issues": linked_issues,
+        "labels":        labels,
+        "components":    components,
+        "status":        (fields.get("status") or {}).get("name", ""),
+        "issue_type":    (fields.get("issuetype") or {}).get("name", ""),
+        "priority":      (fields.get("priority") or {}).get("name", ""),
+        "resolution":    resolution,
+        "fix_versions":  fix_versions,
+        "sprint":        sprint,
+        "created":       fields.get("created", ""),
+        "updated":       fields.get("updated", ""),
     }
 
 
@@ -129,6 +151,7 @@ _DEFAULT_FIELDS = [
     "labels", "components", "status", "issuetype",
     "priority", "created", "updated", "resolution",
     "fixVersions", "customfield_10014",  # fix versions + sprint
+    "issuelinks",                         # linked Jira issues (blocks, relates to, etc.)
 ]
 
 
@@ -221,3 +244,55 @@ def fetch_issues_sync(
 ) -> list[dict]:
     """Synchronous wrapper for use in non-async contexts (e.g. CLI)."""
     return asyncio.run(fetch_issues(jql=jql, max_results=max_results))
+
+
+async def fetch_remote_links(ticket_keys: list[str]) -> dict[str, list[dict]]:
+    """
+    Fetch remote links (GitHub PRs, Bitbucket PRs, external URLs) for the
+    given ticket keys via /rest/api/3/issue/{key}/remotelinks.
+
+    Returns a dict mapping ticket key → list of remote link dicts:
+        {"url": str, "title": str, "relationship": str}
+
+    This supplements the indexed content with live PR/branch links that are
+    added to Jira's development panel but not returned by the bulk search API.
+    """
+    if not ticket_keys or not JIRA_URL or not JIRA_EMAIL or not JIRA_API_TOKEN:
+        return {}
+
+    result: dict[str, list[dict]] = {}
+
+    async with httpx.AsyncClient(
+        base_url=JIRA_URL.rstrip("/"),
+        auth=httpx.BasicAuth(JIRA_EMAIL, JIRA_API_TOKEN),
+        headers={"Accept": "application/json"},
+        timeout=15.0,
+    ) as client:
+        for key in ticket_keys:
+            try:
+                resp = await client.get(f"/rest/api/3/issue/{key}/remotelinks")
+                resp.raise_for_status()
+                links: list[dict] = []
+                for item in resp.json():
+                    obj   = item.get("object") or {}
+                    url   = obj.get("url", "")
+                    title = obj.get("title", url)
+                    rel   = item.get("relationship", "")
+                    if url:
+                        links.append({"url": url, "title": title, "relationship": rel})
+                if links:
+                    result[key] = links
+                    log.info("Remote links for %s: %d link(s).", key, len(links))
+            except httpx.HTTPStatusError as exc:
+                # 404 = no remote links configured; ignore silently
+                if exc.response.status_code != 404:
+                    log.warning("Remote links fetch failed for %s: HTTP %d", key, exc.response.status_code)
+            except httpx.RequestError as exc:
+                log.warning("Remote links request error for %s: %s", key, exc)
+
+    return result
+
+
+def fetch_remote_links_sync(ticket_keys: list[str]) -> dict[str, list[dict]]:
+    """Synchronous wrapper for fetch_remote_links."""
+    return asyncio.run(fetch_remote_links(ticket_keys))

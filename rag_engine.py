@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import time
+import concurrent.futures
 from typing import Any, AsyncGenerator
 
 from dotenv import load_dotenv
@@ -44,6 +45,7 @@ from rag.query_router        import route_query
 from rag.reranker            import rerank, warmup
 from rag.retriever           import retrieve_docs_and_jira, retrieve_all
 from vector_db.chroma_store  import get_store, reset_store
+from connectors.jira_client  import fetch_remote_links
 
 load_dotenv()
 
@@ -247,6 +249,34 @@ def _run_pipeline(
     if route.strategy == "ticket_direct" and route.ticket_ids:
         log.info("Direct ticket fetch: %s", route.ticket_ids)
         jira_docs       = get_store().get_jira_by_tickets(route.ticket_ids)
+
+        # Live-fetch remote links (GitHub/Bitbucket PRs) for the queried tickets.
+        # These are NOT stored in ChromaDB — they live only in Jira's dev panel.
+        # We inject them as synthetic documents so the LLM can surface PR links.
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                remote_links_map = _pool.submit(
+                    asyncio.run, fetch_remote_links(route.ticket_ids)
+                ).result(timeout=15)
+        except Exception as _e:
+            log.warning("Remote links fetch skipped: %s", _e)
+            remote_links_map = {}
+
+        for ticket_key, links in remote_links_map.items():
+            if not links:
+                continue
+            link_lines = [f"Remote Links / Pull Requests for {ticket_key}:"]
+            for lnk in links:
+                rel   = f" [{lnk['relationship']}]" if lnk.get("relationship") else ""
+                title = lnk.get("title") or lnk.get("url", "")
+                url   = lnk.get("url", "")
+                link_lines.append(f"  - {title}{rel}: {url}")
+            from langchain_core.documents import Document as _Doc
+            jira_docs.append(_Doc(
+                page_content="\n".join(link_lines),
+                metadata={"source": "jira", "ticket": ticket_key, "type": "remote_links"},
+            ))
+
         docs, _, conf   = retrieve_all(
             [question],
             docs_k=_DOCS_TOP_K, jira_k=0, confluence_k=_CONFLUENCE_TOP_K,
@@ -263,11 +293,22 @@ def _run_pipeline(
     # 5. Rerank combined pool (keep source split afterwards)
     combined = docs + jira_docs + confluence_docs
     if combined:
-        total_top_n = _DOCS_TOP_K + _JIRA_TOP_K + _CONFLUENCE_TOP_K
-        reranked  = rerank(question, combined, top_n=total_top_n)
-        docs            = [d for d in reranked if d.metadata.get("source") not in ("jira", "confluence")][:_DOCS_TOP_K]
-        jira_docs       = [d for d in reranked if d.metadata.get("source") == "jira"][:_JIRA_TOP_K]
-        confluence_docs = [d for d in reranked if d.metadata.get("source") == "confluence"][:_CONFLUENCE_TOP_K]
+        if route.strategy == "ticket_direct":
+            # For direct ticket fetches keep ALL Jira chunks — the description,
+            # workarounds, and comments are all needed for a full QA analysis.
+            # Only rerank the docs/confluence side.
+            doc_conf_combined = docs + confluence_docs
+            if doc_conf_combined:
+                reranked_dc = rerank(question, doc_conf_combined, top_n=_DOCS_TOP_K + _CONFLUENCE_TOP_K)
+                docs            = [d for d in reranked_dc if d.metadata.get("source") not in ("jira", "confluence")][:_DOCS_TOP_K]
+                confluence_docs = [d for d in reranked_dc if d.metadata.get("source") == "confluence"][:_CONFLUENCE_TOP_K]
+            # jira_docs already contains exactly the fetched ticket chunks — keep all
+        else:
+            total_top_n = _DOCS_TOP_K + _JIRA_TOP_K + _CONFLUENCE_TOP_K
+            reranked  = rerank(question, combined, top_n=total_top_n)
+            docs            = [d for d in reranked if d.metadata.get("source") not in ("jira", "confluence")][:_DOCS_TOP_K]
+            jira_docs       = [d for d in reranked if d.metadata.get("source") == "jira"][:_JIRA_TOP_K]
+            confluence_docs = [d for d in reranked if d.metadata.get("source") == "confluence"][:_CONFLUENCE_TOP_K]
 
     return docs, jira_docs, confluence_docs, expanded, chat_history
 
