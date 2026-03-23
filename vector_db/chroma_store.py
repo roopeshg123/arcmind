@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 
 load_dotenv()
 
@@ -34,10 +35,11 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CHROMA_DB_DIR    = os.getenv("CHROMA_DB_DIR",    "./chroma_db")
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY",   "")
-EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL",  "text-embedding-3-large")
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "100"))
+CHROMA_DB_DIR      = os.getenv("CHROMA_DB_DIR",      "./chroma_db")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY",     "")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai").lower()  # "openai" or "huggingface"
+EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL",    "text-embedding-3-large")
+EMBED_BATCH_SIZE   = int(os.getenv("EMBED_BATCH_SIZE", "100"))
 
 DOCS_COLLECTION        = "arcmind_docs"
 JIRA_COLLECTION        = "arcmind_jira"
@@ -56,7 +58,7 @@ class ChromaStore:
     """Manages two ChromaDB collections and their companion BM25 indexes."""
 
     def __init__(self) -> None:
-        self._embeddings:        OpenAIEmbeddings | None = None
+        self._embeddings:        Any | None = None
         self._docs_store:        Chroma | None = None
         self._jira_store:        Chroma | None = None
         self._confluence_store:  Chroma | None = None
@@ -72,12 +74,19 @@ class ChromaStore:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_embeddings(self) -> OpenAIEmbeddings:
+    def _get_embeddings(self):
         if self._embeddings is None:
-            self._embeddings = OpenAIEmbeddings(
-                model=EMBEDDING_MODEL,
-                openai_api_key=OPENAI_API_KEY,
-            )
+            if EMBEDDING_PROVIDER == "huggingface":
+                self._embeddings = HuggingFaceEmbeddings(
+                    model_name=EMBEDDING_MODEL,
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True},
+                )
+            else:  # default: openai
+                self._embeddings = OpenAIEmbeddings(
+                    model=EMBEDDING_MODEL,
+                    openai_api_key=OPENAI_API_KEY,
+                )
         return self._embeddings
 
     def _get_store(self, collection: str) -> Chroma:

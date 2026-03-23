@@ -37,6 +37,11 @@ from typing import Any, AsyncGenerator
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+try:
+    from langchain_anthropic import ChatAnthropic
+except ImportError:
+    ChatAnthropic = None  # type: ignore
+
 from rag.connector_detector  import detect_connector
 from rag.conversation_memory import get_memory
 from rag.prompt_builder      import build_messages
@@ -54,9 +59,11 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 log = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-CHAT_MODEL     = os.getenv("CHAT_MODEL",     "gpt-4.1")
-CHROMA_DB_DIR  = os.getenv("CHROMA_DB_DIR",  "./chroma_db")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY",    "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CHAT_PROVIDER     = os.getenv("CHAT_PROVIDER",     "openai").lower()  # "openai" or "claude"
+CHAT_MODEL        = os.getenv("CHAT_MODEL",        "gpt-4.1")
+CHROMA_DB_DIR     = os.getenv("CHROMA_DB_DIR",     "./chroma_db")
 RERANKER_TOP_N = int(os.getenv("RERANKER_TOP_N", "5"))
 LOG_DIR        = os.getenv("LOG_DIR",         "./logs")
 
@@ -69,28 +76,42 @@ _JIRA_TOP_K       = int(os.getenv("JIRA_TOP_K",       "4"))
 _CONFLUENCE_TOP_K = int(os.getenv("CONFLUENCE_TOP_K", "4"))
 
 # LLM singletons — created once per process to avoid per-request re-instantiation
-_llm:           ChatOpenAI | None = None
-_llm_streaming: ChatOpenAI | None = None
+_llm:           Any | None = None
+_llm_streaming: Any | None = None
 
 
-def _get_llm(streaming: bool = False) -> ChatOpenAI:
-    """Return a cached ChatOpenAI instance (regular or streaming)."""
+def _build_llm(streaming: bool = False):
+    """Instantiate the correct LLM based on CHAT_PROVIDER env var."""
+    if CHAT_PROVIDER == "claude":
+        if ChatAnthropic is None:
+            raise RuntimeError(
+                "langchain-anthropic is not installed. "
+                "Run: pip install langchain-anthropic"
+            )
+        return ChatAnthropic(
+            model=CHAT_MODEL,
+            anthropic_api_key=ANTHROPIC_API_KEY,
+            temperature=0.1,
+            streaming=streaming,
+        )
+    # default: openai
+    return ChatOpenAI(
+        model=CHAT_MODEL,
+        openai_api_key=OPENAI_API_KEY,
+        temperature=0.1,
+        streaming=streaming,
+    )
+
+
+def _get_llm(streaming: bool = False):
+    """Return a cached LLM instance (regular or streaming)."""
     global _llm, _llm_streaming
     if streaming:
         if _llm_streaming is None:
-            _llm_streaming = ChatOpenAI(
-                model=CHAT_MODEL,
-                openai_api_key=OPENAI_API_KEY,
-                temperature=0.1,
-                streaming=True,
-            )
+            _llm_streaming = _build_llm(streaming=True)
         return _llm_streaming
     if _llm is None:
-        _llm = ChatOpenAI(
-            model=CHAT_MODEL,
-            openai_api_key=OPENAI_API_KEY,
-            temperature=0.1,
-        )
+        _llm = _build_llm(streaming=False)
     return _llm
 
 # ---------------------------------------------------------------------------
