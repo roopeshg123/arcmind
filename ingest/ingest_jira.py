@@ -94,7 +94,19 @@ def _format_ticket_text(issue: dict) -> str:
         lines.append(f"Updated: {_s(issue['updated'])[:10]}")
 
     if issue.get("description"):
-        lines.extend(["", "Description:", _s(issue["description"])[:3000]])
+        desc = _s(issue["description"])
+        # Detect whether the description contains ArcScript or code blocks.
+        # If it does, preserve the full text so scripts are never truncated.
+        # Otherwise cap at 3000 chars to keep chunk size reasonable.
+        _CODE_RE = re.compile(
+            r'<arc:script|arc:set|arc:if|arc:for|arc:while|arc:try|arc:call'
+            r'|```|<script|arcInput|arcOutput',
+            re.IGNORECASE,
+        )
+        if _CODE_RE.search(desc):
+            lines.extend(["", "Description:", desc])          # full — no truncation
+        else:
+            lines.extend(["", "Description:", desc[:3000]])
 
     # Linked Jira issues (blocks, is blocked by, relates to, sub-task of, etc.)
     linked = issue.get("linked_issues") or []
@@ -136,6 +148,19 @@ def issues_to_documents(issues: list[dict]) -> list[Document]:
             for c in issue.get("comment_items", [])
         )
         ticket_hash = hashlib.sha256(hash_seed.encode()).hexdigest()
+
+        # Detect whether this ticket contains ArcScript or Python script examples
+        # so the script generator can specifically target these tickets.
+        _SCRIPT_CONTENT_RE = re.compile(
+            r'<arc:script|arc:set|arc:if|arc:for|arc:while|arc:try|arc:call'
+            r'|arcInput|arcOutput|language=["\']python',
+            re.IGNORECASE,
+        )
+        full_ticket_text = text + " ".join(
+            c.get("body", "") for c in issue.get("comment_items", [])
+        )
+        has_script = "true" if _SCRIPT_CONTENT_RE.search(full_ticket_text) else "false"
+
         base_meta = {
             "source":      "jira",
             "ticket":      issue.get("key", ""),
@@ -146,6 +171,7 @@ def issues_to_documents(issues: list[dict]) -> list[Document]:
             "created":     issue.get("created", ""),
             "updated":     issue.get("updated", ""),
             "ticket_hash": ticket_hash,
+            "has_script":  has_script,
         }
         # --- main ticket document (description only) ---
         docs.append(Document(page_content=text, metadata=base_meta))

@@ -228,8 +228,6 @@
     #input-form {
       display: flex;
       gap: 10px;
-      max-width: 860px;
-      margin: 0 auto;
     }
     #question-input {
       flex: 1;
@@ -289,6 +287,113 @@
     #stop-btn svg { fill: #f08080; }
 
     #input-hint { font-size: .72rem; color: #444; text-align: center; margin-top: 8px; }
+
+    /* --------------------------------------------------------------- slash dropdown */
+    #slash-dropdown {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 0;
+      right: 68px;
+      background: #1e1e2e;
+      border: 1px solid #3a3a5a;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 -4px 20px rgba(0,0,0,.5);
+      z-index: 100;
+    }
+    .slash-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 10px 16px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .slash-option:hover, .slash-option.selected {
+      background: #2a2a3e;
+    }
+    .slash-option .cmd-icon {
+      font-size: 1.1rem;
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+    .slash-option .cmd-name {
+      font-size: .85rem;
+      font-weight: 600;
+      color: #7c8ff5;
+      font-family: "Fira Code", monospace;
+    }
+    .slash-option .cmd-desc {
+      font-size: .78rem;
+      color: #888;
+      margin-top: 2px;
+    }
+    .slash-hint {
+      font-size: .72rem;
+      color: #4caf88;
+      padding: 6px 16px 8px;
+      border-top: 1px solid #2a2a3e;
+      background: #181828;
+    }
+
+    /* ---------------------------------------------------------------- tool badge */
+    .tool-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: .7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      padding: 2px 9px;
+      border-radius: 999px;
+      margin-bottom: 8px;
+    }
+    .tool-badge.error_decoder   { background: #3a1a1a; color: #f08080; border: 1px solid #8b2e2e; }
+    .tool-badge.edi_explainer   { background: #1a2a3a; color: #7ab0f0; border: 1px solid #2e5e8b; }
+    .tool-badge.similar_tickets { background: #1a2a1a; color: #80d080; border: 1px solid #2e6e2e; }
+    .tool-badge.ticket_generator{ background: #2a1a3a; color: #c080f0; border: 1px solid #6e2e8b; }
+    .tool-badge.connector_changelog { background: #2a2a1a; color: #d0c050; border: 1px solid #7e6e2e; }
+    .tool-badge.script_generator     { background: #1a2a2a; color: #50d0c0; border: 1px solid #2e7e6e; }
+    .tool-badge.script_debugger      { background: #2a1a2a; color: #d070d0; border: 1px solid #7e2e7e; }
+
+    /* ------------------------------------------------------------- related issues */
+    .related-issues {
+      margin-top: 10px;
+      padding: 10px 14px;
+      background: #1a1a2a;
+      border: 1px solid #2a2a4a;
+      border-radius: 8px;
+      font-size: .78rem;
+    }
+    .related-issues .related-title {
+      color: #7c8ff5;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .related-issues ul { padding-left: 0; list-style: none; }
+    .related-issues li {
+      padding: 4px 0;
+      border-bottom: 1px solid #1e1e3e;
+      color: #aaa;
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .related-issues li:last-child { border-bottom: none; }
+    .related-issues .ri-ticket {
+      font-weight: 700;
+      color: #7c8ff5;
+      font-family: monospace;
+      flex-shrink: 0;
+    }
+    .related-issues .ri-status {
+      font-size: .68rem;
+      color: #666;
+      flex-shrink: 0;
+    }
+    #input-wrapper { position: relative; max-width: 860px; margin: 0 auto; }
   </style>
 </head>
 <body>
@@ -327,22 +432,26 @@
 
 <!-- =========================================================== INPUT -->
 <div id="input-area">
-  <form id="input-form" onsubmit="sendMessage(event)">
-    <textarea
-      id="question-input"
-      placeholder="Ask anything about your Arc application…"
-      rows="1"
-      onkeydown="handleKey(event)"
-    ></textarea>
-    <button id="send-btn" type="submit" title="Send">
-      <svg width="20" height="20" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-    </button>
-    <button id="stop-btn" type="button" title="Stop generating" onclick="stopGeneration()">
-      <svg width="16" height="16" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-      Stop
-    </button>
-  </form>
-  <p id="input-hint">Press Enter to send &nbsp;·&nbsp; Shift+Enter for new line</p>
+  <div id="input-wrapper">
+    <div id="slash-dropdown"></div>
+    <form id="input-form" onsubmit="sendMessage(event)" style="display:flex;gap:10px;">
+      <textarea
+        id="question-input"
+        placeholder="Ask anything… or type / for Arc tools (e.g. /error, /similar, /ticket)"
+        rows="1"
+        onkeydown="handleKey(event)"
+        oninput="handleSlashInput()"
+      ></textarea>
+      <button id="send-btn" type="submit" title="Send">
+        <svg width="20" height="20" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      </button>
+      <button id="stop-btn" type="button" title="Stop generating" onclick="stopGeneration()">
+        <svg width="16" height="16" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+        Stop
+      </button>
+    </form>
+  </div>
+  <p id="input-hint">Press Enter to send &nbsp;·&nbsp; Shift+Enter for new line &nbsp;·&nbsp; Type <kbd style="background:#222;border:1px solid #444;padding:1px 5px;border-radius:4px;font-size:.75em">/</kbd> for Arc tools</p>
 </div>
 
 <script>
@@ -351,6 +460,160 @@
   let messageLog   = [];   // [{role, content, sources}, …]  — persisted
   let isLoading    = false;
   let abortCtrl    = null;  // AbortController for the active request
+
+  // ---------------------------------------------------------------- slash commands registry
+  const SLASH_COMMANDS = {
+    "/error": {
+      icon: "🔴",
+      label: "/error",
+      desc: "Decode an Arc error log — paste the error after the command",
+      hint: "Paste your error message after /error ",
+      endpoint: "/api/tools/error-decode",
+      bodyKey: "error_text",
+    },
+    "/explain": {
+      icon: "📋",
+      label: "/explain",
+      desc: "Explain an X12 or EDIFACT message — paste the raw EDI after the command",
+      hint: "Paste raw EDI (X12/EDIFACT) after /explain ",
+      endpoint: "/api/tools/edi-explain",
+      bodyKey: "edi_text",
+    },
+    "/similar": {
+      icon: "🔗",
+      label: "/similar",
+      desc: "Find tickets related to a Jira ID — e.g. /similar ARCESB-12345",
+      hint: "Type a Jira ticket ID after /similar ",
+      endpoint: "/api/tools/similar",
+      bodyKey: "ticket_id",
+    },
+    "/ticket": {
+      icon: "📝",
+      label: "/ticket",
+      desc: "Draft a Jira ticket from plain English — e.g. /ticket AS2 connection times out",
+      hint: "Describe the issue in plain English after /ticket ",
+      endpoint: "/api/tools/generate-ticket",
+      bodyKey: "description",
+    },
+    "/changelog": {
+      icon: "📅",
+      label: "/changelog",
+      desc: "Get the change history for a connector — e.g. /changelog AS2",
+      hint: "Type a connector name after /changelog  (e.g. AS2, SFTP, X12)",
+      endpoint: "/api/tools/changelog",
+      bodyKey: "connector",
+    },
+    "/script": {
+      icon: "⚙️",
+      label: "/script",
+      desc: "Generate an ArcScript or Python script — e.g. /script loop over items and set output field",
+      hint: "Describe what the script should do after /script ",
+      endpoint: "/api/tools/generate-script",
+      bodyKey: "requirement",
+    },
+    "/fix": {
+      icon: "🔧",
+      label: "/fix",
+      desc: "Fix a broken script — paste: <error description or JSON test file> ||| <broken script>",
+      hint: "Format: /fix <what is wrong OR paste JSON test file> ||| <paste broken script here>",
+      endpoint: "/api/tools/fix-script",
+      bodyKey: null,          // special: split on ||| into script + error_description
+      special: "fix_script",
+    },
+  };
+
+  const TOOL_LABELS = {
+    error_decoder:        "🔴 Error Decoder",
+    edi_explainer:        "📋 EDI Explainer",
+    similar_tickets:      "🔗 Similar Tickets",
+    ticket_generator:     "📝 Ticket Generator",
+    connector_changelog:  "📅 Changelog",
+    script_generator:     "⚙️ Script Generator",
+    script_debugger:      "🔧 Script Debugger",
+  };
+
+  let slashDropdownIndex = -1;
+
+  // ---------------------------------------------------------------- slash dropdown
+  function handleSlashInput() {
+    const input = document.getElementById("question-input");
+    const val   = input.value;
+
+    // Auto-grow
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+
+    if (!val.startsWith("/")) { hideSlashDropdown(); return; }
+
+    const lower   = val.toLowerCase();
+    const matches = Object.values(SLASH_COMMANDS).filter(c =>
+      c.label.startsWith(lower.split(" ")[0])
+    );
+
+    if (matches.length === 0) { hideSlashDropdown(); return; }
+
+    // If user has finished typing the command and a space, show only the hint
+    const parts = val.split(" ");
+    const cmd   = SLASH_COMMANDS[parts[0].toLowerCase()];
+    const ddEl  = document.getElementById("slash-dropdown");
+
+    if (cmd && parts.length > 1) {
+      ddEl.innerHTML = `<div class="slash-hint">💡 ${escapeHtml(cmd.hint)}</div>`;
+      ddEl.style.display = "block";
+      return;
+    }
+
+    // Show matching commands
+    ddEl.innerHTML = matches.map((c, i) => `
+      <div class="slash-option${i === slashDropdownIndex ? " selected" : ""}"
+           onclick="selectSlashCommand('${c.label}')">
+        <span class="cmd-icon">${c.icon}</span>
+        <div>
+          <div class="cmd-name">${escapeHtml(c.label)}</div>
+          <div class="cmd-desc">${escapeHtml(c.desc)}</div>
+        </div>
+      </div>`).join("") +
+      `<div class="slash-hint">↑↓ navigate · Tab/Enter to select</div>`;
+    ddEl.style.display = "block";
+    slashDropdownIndex = -1;
+  }
+
+  function hideSlashDropdown() {
+    const ddEl = document.getElementById("slash-dropdown");
+    ddEl.style.display = "none";
+    ddEl.innerHTML     = "";
+    slashDropdownIndex = -1;
+  }
+
+  function selectSlashCommand(cmdLabel) {
+    const input = document.getElementById("question-input");
+    input.value = cmdLabel + " ";
+    hideSlashDropdown();
+    input.focus();
+    handleSlashInput();
+  }
+
+  function navigateDropdown(dir) {
+    const ddEl   = document.getElementById("slash-dropdown");
+    const opts   = ddEl.querySelectorAll(".slash-option");
+    if (!opts.length) return false;
+    slashDropdownIndex = (slashDropdownIndex + dir + opts.length) % opts.length;
+    opts.forEach((o, i) => o.classList.toggle("selected", i === slashDropdownIndex));
+    return true;
+  }
+
+  // Parse "/command arg" → { cmd: SLASH_COMMANDS entry, arg: "arg text" } or null
+  function parseSlashCommand(text) {
+    if (!text.startsWith("/")) return null;
+    const spaceIdx = text.indexOf(" ");
+    if (spaceIdx === -1) return null;
+    const cmdKey = text.slice(0, spaceIdx).toLowerCase();
+    const cmd    = SLASH_COMMANDS[cmdKey];
+    if (!cmd) return null;
+    const arg = text.slice(spaceIdx + 1).trim();
+    if (!arg) return null;
+    return { cmd, arg };
+  }
 
   // ---------------------------------------------------------------- persistence
   function saveSession() {
@@ -780,9 +1043,31 @@
 
   // ---------------------------------------------------------------- chat
   function handleKey(e) {
+    const ddVisible = document.getElementById("slash-dropdown").style.display === "block";
+
+    // Dropdown navigation
+    if (ddVisible) {
+      if (e.key === "ArrowUp")   { e.preventDefault(); navigateDropdown(-1); return; }
+      if (e.key === "ArrowDown") { e.preventDefault(); navigateDropdown(+1); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && slashDropdownIndex >= 0)) {
+        e.preventDefault();
+        const opts = document.getElementById("slash-dropdown").querySelectorAll(".slash-option");
+        if (slashDropdownIndex >= 0 && opts[slashDropdownIndex]) {
+          const lbl = opts[slashDropdownIndex].querySelector(".cmd-name").textContent;
+          selectSlashCommand(lbl);
+        } else if (e.key === "Tab" && opts.length) {
+          const lbl = opts[0].querySelector(".cmd-name").textContent;
+          selectSlashCommand(lbl);
+        }
+        return;
+      }
+      if (e.key === "Escape") { hideSlashDropdown(); return; }
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       document.getElementById("input-form").requestSubmit();
+      return;
     }
     // Auto-grow textarea
     const ta = e.target;
@@ -797,6 +1082,15 @@
     const input    = document.getElementById("question-input");
     const question = input.value.trim();
     if (!question) return;
+
+    hideSlashDropdown();
+
+    // Check if this is a slash command
+    const parsed = parseSlashCommand(question);
+    if (parsed) {
+      await runSlashCommand(parsed, question);
+      return;
+    }
 
     input.value       = "";
     input.style.height = "52px";
@@ -832,20 +1126,89 @@
       } else {
         const data = await res.json();
         chatHistory.push({ role: "assistant", content: data.answer });
-        appendMessage("bot", data.answer, data.sources);
+        appendMessage("bot", data.answer, data.sources, null, data.jira_issues);
         messageLog.push({ role: "bot", content: data.answer, sources: data.sources || [] });
         saveSession();
       }
     } catch (err) {
       removeTyping(typingId);
       if (err.name === "AbortError") {
-        // Remove the user message that was never answered from history
         chatHistory.pop();
         messageLog.pop();
         saveSession();
         appendMessage("bot", "_Generation stopped._");
       } else {
         appendMessage("bot", "⚠️ Could not reach the server. Make sure the backend is running.");
+      }
+    } finally {
+      isLoading  = false;
+      abortCtrl  = null;
+      showStopButton(false);
+      setInputEnabled(true);
+      document.getElementById("question-input").focus();
+    }
+  }
+
+  // ---------------------------------------------------------------- slash command runner
+  async function runSlashCommand(parsed, rawQuestion) {
+    const { cmd, arg } = parsed;
+    const input = document.getElementById("question-input");
+    input.value        = "";
+    input.style.height = "52px";
+
+    hideEmptyState();
+    appendMessage("user", rawQuestion);
+    messageLog.push({ role: "user", content: rawQuestion, sources: [] });
+    saveSession();
+
+    const typingId = appendTyping();
+    isLoading  = true;
+    abortCtrl  = new AbortController();
+    setInputEnabled(false);
+    showStopButton(true);
+
+    try {
+      let body = {};
+      if (cmd.special === "fix_script") {
+        // Format: <error description> ||| <broken script>
+        const sepIdx = arg.indexOf("|||");
+        if (sepIdx === -1) {
+          removeTyping(typingId);
+          appendMessage("bot", "⚠️ `/fix` format: describe the error (or paste your JSON test file), then `|||`, then paste the broken script.\n\nExamples:\n`/fix arc:set is using wrong attribute ||| <arc:script>...</arc:script>`\n`/fix {\"name\": \"Roopesh\", ...} ||| <arc:script>...</arc:script>`  ← paste JSON test data to show the script produced no output");
+          isLoading = false; abortCtrl = null; showStopButton(false); setInputEnabled(true);
+          document.getElementById("question-input").focus();
+          return;
+        }
+        body = {
+          error_description: arg.slice(0, sepIdx).trim(),
+          script:            arg.slice(sepIdx + 3).trim(),
+        };
+      } else {
+        body[cmd.bodyKey] = arg;
+      }
+
+      const res = await fetch(cmd.endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: abortCtrl.signal,
+        body: JSON.stringify(body),
+      });
+
+      removeTyping(typingId);
+
+      if (!res.ok) {
+        const err = await res.json();
+        appendMessage("bot", `⚠️ ${err.detail || "Tool error."}`, [], null);
+      } else {
+        const data = await res.json();
+        appendMessage("bot", data.answer, data.sources || [], data.tool, data.jira_issues || []);
+        messageLog.push({ role: "bot", content: data.answer, sources: data.sources || [] });
+        saveSession();
+      }
+    } catch (err) {
+      removeTyping(typingId);
+      if (err.name !== "AbortError") {
+        appendMessage("bot", "⚠️ Could not reach the server.");
       }
     } finally {
       isLoading  = false;
@@ -872,7 +1235,7 @@
     if (es) es.remove();
   }
 
-  function appendMessage(role, text, sources = []) {
+  function appendMessage(role, text, sources = [], toolType = null, jiraIssues = []) {
     const container = document.getElementById("messages");
     const row = document.createElement("div");
     row.className = `msg-row ${role}`;
@@ -888,11 +1251,19 @@
     name.className = "name";
     name.textContent = role === "user" ? "You" : "Assistant";
 
+    bubble.appendChild(name);
+
+    // Tool badge (only for bot tool responses)
+    if (toolType && TOOL_LABELS[toolType]) {
+      const badge = document.createElement("div");
+      badge.className = `tool-badge ${toolType}`;
+      badge.textContent = TOOL_LABELS[toolType];
+      bubble.appendChild(badge);
+    }
+
     const textDiv = document.createElement("div");
     textDiv.className = "text";
     textDiv.innerHTML = markdownToHtml(text);
-
-    bubble.appendChild(name);
     bubble.appendChild(textDiv);
 
     // Sources
@@ -908,6 +1279,32 @@
       });
       srcBox.appendChild(ul);
       bubble.appendChild(srcBox);
+    }
+
+    // Related / matched Jira issues panel
+    if (jiraIssues && jiraIssues.length > 0) {
+      const seen = new Set();
+      const unique = jiraIssues.filter(j => {
+        if (!j.ticket || seen.has(j.ticket)) return false;
+        seen.add(j.ticket);
+        return true;
+      });
+      if (unique.length > 0) {
+        const riBox = document.createElement("div");
+        riBox.className = "related-issues";
+        riBox.innerHTML = `<div class="related-title">🎫 Referenced Jira Tickets</div>`;
+        const ul = document.createElement("ul");
+        unique.forEach(j => {
+          const li = document.createElement("li");
+          li.innerHTML =
+            `<span class="ri-ticket">${escapeHtml(j.ticket)}</span>` +
+            `<span class="ri-status">[${escapeHtml(j.status || "?")}]</span>` +
+            `<span>${escapeHtml(j.component || "")}</span>`;
+          ul.appendChild(li);
+        });
+        riBox.appendChild(ul);
+        bubble.appendChild(riBox);
+      }
     }
 
     row.appendChild(avatar);

@@ -3,16 +3,26 @@ ArcMind FastAPI Application
 
 REST API endpoints
 ------------------
-  GET  /                          Serve the chat UI  (static/index.html)
-  GET  /api/status                Collection health check + vector counts
-  POST /api/ingest                Ingest Arc documentation (HTML)
-  POST /api/ingest/jira           Ingest Jira issues
-  POST /api/ingest/jira/sync      Incremental Jira sync (last N hours)
-  POST /api/ingest/confluence     Ingest Confluence pages
-  POST /api/ingest/confluence/sync  Incremental Confluence sync (last N hours)
+  GET  /                              Serve the chat UI  (static/index.html)
+  GET  /api/status                    Collection health check + vector counts
+  POST /api/ingest                    Ingest Arc documentation (HTML)
+  POST /api/ingest/jira               Ingest Jira issues
+  POST /api/ingest/jira/sync          Incremental Jira sync (last N hours)
+  POST /api/ingest/confluence         Ingest Confluence pages
+  POST /api/ingest/confluence/sync    Incremental Confluence sync (last N hours)
   POST /api/ingest/confluence/update  Smart Confluence update (changed pages only)
-  POST /api/chat                  Blocking Q&A — returns full answer at once
-  POST /api/chat/stream           Streaming Q&A — Server-Sent Events (SSE)
+  POST /api/chat                      Blocking Q&A — returns full answer at once
+  POST /api/chat/stream               Streaming Q&A — Server-Sent Events (SSE)
+
+Arc-Specific Intelligence Tools (slash commands)
+-------------------------------------------------
+  POST /api/tools/error-decode     Diagnose an Arc error log → root cause + fix
+  POST /api/tools/edi-explain      Explain an X12/EDIFACT message segment-by-segment
+  POST /api/tools/similar          Find Jira tickets similar to a given ticket ID
+  POST /api/tools/generate-ticket  Draft a Jira ticket from plain-English description
+  POST /api/tools/changelog        Structured changelog for an Arc connector
+  POST /api/tools/generate-script  Generate ArcScript or Python script from plain English
+  POST /api/tools/fix-script        Debug and fix a broken ArcScript or Python script
 """
 
 import asyncio
@@ -34,6 +44,7 @@ load_dotenv()
 import rag_engine
 from ingest import run_ingestion
 from ingest.ingest_jira import ingest_jira_async, incremental_jira_sync_async, smart_jira_update_async
+from rag import arc_tools
 from ingest.ingest_docs import smart_docs_update
 from ingest.ingest_confluence import (
     ingest_confluence_async,
@@ -512,6 +523,257 @@ async def confluence_smart_update(request: ConfluenceIngestRequest):
                 "vectors": result.get("vectors_stored", 0) if result else 0,
             }
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models — Arc-specific tools
+# ---------------------------------------------------------------------------
+
+class ErrorDecodeRequest(BaseModel):
+    error_text: str
+
+    @field_validator("error_text")
+    @classmethod
+    def _check_error_text(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("error_text cannot be empty")
+        if len(v) > 8000:
+            raise ValueError("error_text must not exceed 8 000 characters")
+        return v
+
+
+class EDIExplainRequest(BaseModel):
+    edi_text: str
+
+    @field_validator("edi_text")
+    @classmethod
+    def _check_edi_text(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("edi_text cannot be empty")
+        if len(v) > 16000:
+            raise ValueError("edi_text must not exceed 16 000 characters")
+        return v
+
+
+class SimilarTicketsRequest(BaseModel):
+    ticket_id: str
+
+    @field_validator("ticket_id")
+    @classmethod
+    def _check_ticket_id(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not re.match(r'^[A-Z][A-Z0-9]+-\d+$', v):
+            raise ValueError("ticket_id must be a valid Jira key, e.g. ARCESB-12345")
+        return v
+
+
+class GenerateTicketRequest(BaseModel):
+    description: str
+
+    @field_validator("description")
+    @classmethod
+    def _check_description(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("description cannot be empty")
+        if len(v) > 4000:
+            raise ValueError("description must not exceed 4 000 characters")
+        return v
+
+
+class ChangelogRequest(BaseModel):
+    connector: str
+
+    @field_validator("connector")
+    @classmethod
+    def _check_connector(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("connector cannot be empty")
+        return v.strip()
+
+
+class GenerateScriptRequest(BaseModel):
+    requirement: str
+
+    @field_validator("requirement")
+    @classmethod
+    def _check_requirement(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("requirement cannot be empty")
+        if len(v) > 4000:
+            raise ValueError("requirement must not exceed 4 000 characters")
+        return v
+
+
+class FixScriptRequest(BaseModel):
+    script: str
+    error_description: str
+
+    @field_validator("script")
+    @classmethod
+    def _check_script(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("script cannot be empty")
+        if len(v) > 8000:
+            raise ValueError("script must not exceed 8 000 characters")
+        return v
+
+    @field_validator("error_description")
+    @classmethod
+    def _check_error_description(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("error_description cannot be empty")
+        if len(v) > 2000:
+            raise ValueError("error_description must not exceed 2 000 characters")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Routes — Arc-specific intelligence tools
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tools/error-decode")
+async def tool_error_decode(request: ErrorDecodeRequest):
+    """
+    Diagnose a CData Arc error log or exception.
+
+    Searches docs + Jira history + Confluence for matching issues,
+    returns root-cause analysis and step-by-step fix.
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(status_code=503, detail="Documentation not indexed yet.")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(arc_tools.decode_error, error_text=request.error_text),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@app.post("/api/tools/edi-explain")
+async def tool_edi_explain(request: EDIExplainRequest):
+    """
+    Explain a raw X12 or EDIFACT message segment-by-segment in plain English.
+
+    Annotates each element, flags invalid values, gives business summary
+    and CData Arc handling tips.
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(status_code=503, detail="Documentation not indexed yet.")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(arc_tools.explain_edi, edi_text=request.edi_text),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@app.post("/api/tools/similar")
+async def tool_similar_tickets(request: SimilarTicketsRequest):
+    """
+    Find Jira tickets similar to the given ticket ID.
+
+    Uses the ticket's content as a vector search query, deduplicates
+    by ticket key, and returns a relationship analysis.
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(status_code=503, detail="Documentation not indexed yet.")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(arc_tools.find_similar, ticket_id=request.ticket_id),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@app.post("/api/tools/generate-ticket")
+async def tool_generate_ticket(request: GenerateTicketRequest):
+    """
+    Draft a Jira ticket from a plain-English problem description.
+
+    Auto-detects the Arc component, finds related past tickets,
+    and returns a fully structured ticket ready to copy into Jira.
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(status_code=503, detail="Documentation not indexed yet.")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(arc_tools.generate_ticket_draft, description=request.description),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@app.post("/api/tools/changelog")
+async def tool_changelog(request: ChangelogRequest):
+    """
+    Return a structured changelog for the given Arc connector/component.
+
+    Groups resolved Jira tickets by Fix Version so you can see
+    exactly what changed in each release.
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(status_code=503, detail="Documentation not indexed yet.")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(arc_tools.connector_changelog, connector_name=request.connector),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@app.post("/api/tools/generate-script")
+async def tool_generate_script(request: GenerateScriptRequest):
+    """
+    Generate a working ArcScript or Python script from a plain-English requirement.
+
+    Retrieves scripting docs and Jira context, then produces a complete,
+    annotated script with placement instructions.
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(status_code=503, detail="Documentation not indexed yet.")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(arc_tools.generate_script, requirement=request.requirement),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@app.post("/api/tools/fix-script")
+async def tool_fix_script(request: FixScriptRequest):
+    """
+    Diagnose and fix a broken ArcScript or Python script.
+
+    Accepts the broken script and a description of the error or wrong behaviour,
+    retrieves scripting docs, and returns the fully corrected script with
+    a detailed explanation of every change made.
+    """
+    if not rag_engine.is_vector_store_ready():
+        raise HTTPException(status_code=503, detail="Documentation not indexed yet.")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                arc_tools.fix_script,
+                script=request.script,
+                error_description=request.error_description,
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
     return result
 
 

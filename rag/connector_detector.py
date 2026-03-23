@@ -39,13 +39,35 @@ _CONNECTOR_PATTERNS: dict[str, list[str]] = {
 }
 
 
+def _extract_connector_type_from_json(text: str) -> str | None:
+    """
+    Extract ConnectorType from an Arc connector config JSON blob.
+
+    Handles inputs like {"ConnectorType": "JSON", ...} that come from
+    the Arc connector configuration panel or generate-script requirements.
+    """
+    m = re.search(r'"ConnectorType"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+    if not m:
+        return None
+    connector_type = m.group(1).strip()
+    for connector in _CONNECTOR_PATTERNS:
+        if connector.lower() == connector_type.lower():
+            return connector
+    return None
+
+
 def detect_connector(query: str) -> str | None:
     """
     Return the first Arc connector name matched in *query*, or None.
 
+    Checks for a ConnectorType JSON field first (e.g. Arc connector config
+    blobs), then falls back to regex pattern matching.
     Matching is case-insensitive.  Patterns are tested in the order they
     appear in _CONNECTOR_PATTERNS (most-specific first).
     """
+    cfg_connector = _extract_connector_type_from_json(query)
+    if cfg_connector:
+        return cfg_connector
     for connector, patterns in _CONNECTOR_PATTERNS.items():
         for pattern in patterns:
             if re.search(pattern, query, re.IGNORECASE):
