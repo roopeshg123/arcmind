@@ -1,7 +1,9 @@
 # ArcMind — Enterprise AI Assistant for Arc
 
-Chat with your Arc documentation, **Jira ticket history**, and **Confluence wiki** using OpenAI GPT and a local hybrid search engine.
+Chat with your Arc documentation, **Jira ticket history**, and **Confluence wiki** using **OpenAI GPT or Anthropic Claude** and a local hybrid search engine.
 Ask questions in plain English and get accurate, sourced answers instantly — from your product docs, real support/bug history, and internal knowledge base.
+
+> **LLM backend is switchable** — set `CHAT_PROVIDER=openai` (GPT-4.1) or `CHAT_PROVIDER=claude` (Claude Sonnet/Opus/Haiku) in your `.env`.
 
 ---
 
@@ -44,7 +46,9 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 | **Uvicorn** | ASGI server |
 | **LangChain** | Document splitting, prompt chains, LLM integration |
 | **ChromaDB** | Local vector database (**three collections**: docs + jira + confluence) |
-| **OpenAI API** | Embeddings (`text-embedding-3-large`) + Chat (`gpt-4.1`) |
+| **OpenAI API** | Embeddings (`text-embedding-3-large`) + Chat (`gpt-4.1`) — when `CHAT_PROVIDER=openai` |
+| **Anthropic API** | Chat (`claude-sonnet-4-5` / opus / haiku) — when `CHAT_PROVIDER=claude` |
+| **langchain-anthropic** | LangChain integration for Anthropic Claude models |
 | **rank-bm25** | BM25 keyword search (hybrid retrieval alongside vectors) |
 | **sentence-transformers** | Cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`) |
 | **BeautifulSoup4 / lxml** | HTML parsing and text extraction |
@@ -58,7 +62,10 @@ Ask questions in plain English and get accurate, sourced answers instantly — f
 
 - **Python 3.12** — [python.org/downloads](https://www.python.org/downloads/)
 - **Git** — [git-scm.com](https://git-scm.com)
-- **OpenAI API Key** — [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (billing must be enabled)
+- **LLM API Key** — choose one:
+  - **OpenAI** (`CHAT_PROVIDER=openai`) — [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (billing must be enabled)
+  - **Anthropic Claude** (`CHAT_PROVIDER=claude`) — [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
+- **OpenAI API Key** — always required for embeddings (`text-embedding-3-large`), even when using Claude for chat
 - **Your docs folder** — folder containing your `.html` documentation files
 - *(Optional)* **Jira API token** — from [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
 - *(Optional)* **Confluence API token** — same Atlassian token works for both Jira and Confluence
@@ -95,10 +102,21 @@ The `.env` file is already in the repo with placeholder values. Just open it and
 notepad .env
 ```
 
-Minimum required:
+Minimum required (OpenAI chat):
 
 ```env
+CHAT_PROVIDER=openai
 OPENAI_API_KEY=sk-proj-...your-key-here...
+DOCS_DIR=C:\path\to\your\html\docs
+```
+
+Minimum required (Claude chat):
+
+```env
+CHAT_PROVIDER=claude
+ANTHROPIC_API_KEY=sk-ant-...your-key-here...
+OPENAI_API_KEY=sk-proj-...your-key-here...   # still needed for embeddings
+CHAT_MODEL=claude-sonnet-4-5
 DOCS_DIR=C:\path\to\your\html\docs
 ```
 
@@ -250,7 +268,7 @@ Stop: `docker compose down`
 3. **Query expansion** — The question is rewritten into 5 variants covering synonyms, acronym expansions, and related sub-topics.
 4. **Hybrid retrieval** — Each variant is searched across all three ChromaDB collections (docs, Jira, Confluence) using both semantic vector search and BM25. Results are merged and deduplicated.
 5. **Reranking** — A local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores all candidates against the original question. Top `RERANKER_TOP_N` chunks are kept.
-6. **Answer generation** — Top doc chunks, Confluence wiki pages, and a clustered Jira summary are injected into a strict prompt and sent to `gpt-4.1`. Streaming is available via `/api/chat/stream`. Confluence citations are rendered as clickable hyperlinks.
+6. **Answer generation** — Top doc chunks, Confluence wiki pages, and a clustered Jira summary are injected into a strict prompt and sent to the configured LLM (`gpt-4.1` when `CHAT_PROVIDER=openai`, or `claude-sonnet-4-5` by default when `CHAT_PROVIDER=claude`). Streaming is available via `/api/chat/stream`. Confluence citations are rendered as clickable hyperlinks.
 7. **Session memory** — When a `session_id` is provided, server-side conversation history is maintained per session across multiple turns.
 8. **Query logging** — Every question is appended to `logs/query_log.jsonl` with the expanded queries, retrieval counts (docs + jira + confluence), and answer preview for self-improvement analysis.
 
@@ -260,10 +278,12 @@ Stop: `docker compose down`
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required)* | Your OpenAI secret key |
+| `CHAT_PROVIDER` | `openai` | LLM backend: `openai` (GPT) or `claude` (Anthropic) |
+| `OPENAI_API_KEY` | *(required)* | Your OpenAI secret key — always needed for embeddings |
+| `ANTHROPIC_API_KEY` | *(required if `CHAT_PROVIDER=claude`)* | Your Anthropic API key |
 | `API_KEY` | *(unset)* | When set, all `/api/*` requests must include `X-API-Key: <value>`. Leave unset in dev. |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins. Restrict in production (e.g. `https://yoursite.com`). |
-| `CHAT_MODEL` | `gpt-4.1` | OpenAI model for answers |
+| `CHAT_MODEL` | `gpt-4.1` (openai) / `claude-sonnet-4-5` (claude) | Chat model for answers |
 | `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model |
 | `CHUNK_SIZE` | `1500` | Tokens per chunk |
 | `CHUNK_OVERLAP` | `300` | Token overlap between chunks |
@@ -280,7 +300,7 @@ Stop: `docker compose down`
 | `JIRA_URL` | — | Atlassian Cloud URL (e.g. `https://your-org.atlassian.net`) |
 | `JIRA_EMAIL` | — | Login email for Jira API auth |
 | `JIRA_API_TOKEN` | — | API token from Atlassian account settings |
-| `JIRA_PROJECT_KEY` | — | Jira project key to index (e.g. `ARCESB`) |
+| `JIRA_PROJECT_KEY` | — | Jira project key to index (e.g. `YOUR_PROJECT`) |
 | `CONFLUENCE_URL` | — | Atlassian Cloud URL — same as `JIRA_URL` |
 | `CONFLUENCE_EMAIL` | — | Same email as Jira |
 | `CONFLUENCE_API_TOKEN` | — | Same API token as Jira |

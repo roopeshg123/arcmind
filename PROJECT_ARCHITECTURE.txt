@@ -4,7 +4,7 @@
   Project   : Arc Docs AI Assistant (ArcMind)
   Type      : RAG-Powered AI Chatbot
   Path      : D:\arcmind
-  Version   : 2.1.0
+  Version   : 2.2.0
   Date      : March 2026
 ================================================================================
 
@@ -76,8 +76,8 @@ When you ask a question:
   - It is predicting "what is the most useful and accurate next word?"
 
 Popular LLMs:
-  - GPT-4o, GPT-4o-mini  (OpenAI) ← used in THIS project
-  - Claude 3.5 Sonnet     (Anthropic)
+  - GPT-4.1, GPT-4o, GPT-4o-mini  (OpenAI)  ← supported via CHAT_PROVIDER=openai
+  - Claude Sonnet 4-5, Opus 4-5, Haiku 3-5 (Anthropic) ← supported via CHAT_PROVIDER=claude  ← DEFAULT
   - Gemini 1.5 Pro        (Google)
   - LLaMA 3               (Meta, open source)
 
@@ -114,13 +114,22 @@ OpenAI API services used in this project:
   ┌─────────────────────────────┬───────────────────────────────────────────┐
   │ Service                     │ Purpose                                   │
   ├─────────────────────────────┼───────────────────────────────────────────┤
-  │ Chat Completions API        │ Generates answers to your questions       │
-  │ (gpt-4.1)                   │ Endpoint: /v1/chat/completions            │
-  ├─────────────────────────────┼───────────────────────────────────────────┤
   │ Embeddings API              │ Converts text into 3072-dim vectors       │
   │ (text-embedding-3-large)    │ Endpoint: /v1/embeddings                  │
- 2.5  What are Embeddings / Vectors?
-──────────────────────────────────────────
+  │                             │ Always used regardless of CHAT_PROVIDER   │
+  ├─────────────────────────────┼───────────────────────────────────────────┤
+  │ Chat Completions API        │ Generates answers (CHAT_PROVIDER=openai)  │
+  │ (gpt-4.1)                   │ Endpoint: /v1/chat/completions            │
+  └─────────────────────────────┴───────────────────────────────────────────┘
+
+Anthropic API services used in this project (when CHAT_PROVIDER=claude):
+
+  ┌─────────────────────────────┬───────────────────────────────────────────┐
+  │ Service                     │ Purpose                                   │
+  ├─────────────────────────────┼───────────────────────────────────────────┤
+  │ Messages API                │ Generates answers via Claude models       │
+  │ (claude-sonnet-4-5)         │ via langchain-anthropic (ChatAnthropic)   │
+  └─────────────────────────────┴───────────────────────────────────────────┘
 
 An embedding is a way to convert text into a list of numbers (a vector) that
 captures its MEANING.
@@ -278,7 +287,7 @@ QUERY PHASE (runs every time you ask a question):
   Step 3: QUERY EXPANSION
     ┌─────────────────────────────────────────┐
     │  query_expander.py sends the query to   │
-    │  gpt-4.1 (singleton, cached)            │
+    │  the configured LLM (singleton, cached) │
     │  Generates 5 variants covering:         │
     │   - synonyms                            │
     │   - acronym expansions                  │
@@ -354,7 +363,10 @@ QUERY PHASE (runs every time you ask a question):
   D:\arcmind\
   │
   ├── .env                    ← Local config — NEVER commit (contains real API keys)
-  │                             OPENAI_API_KEY, API_KEY, CORS_ORIGINS,
+  │                             CHAT_PROVIDER (openai | claude),
+  │                             OPENAI_API_KEY (always needed for embeddings),
+  │                             ANTHROPIC_API_KEY (when CHAT_PROVIDER=claude),
+  │                             API_KEY, CORS_ORIGINS,
   │                             JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN,
   │                             JIRA_PROJECT_KEY,
   │                             CONFLUENCE_URL, CONFLUENCE_EMAIL,
@@ -377,7 +389,9 @@ QUERY PHASE (runs every time you ask a question):
   │                             /api/ingest/progress, /api/status
   │
   ├── rag_engine.py           ← Top-level RAG pipeline
-  │                             ChatOpenAI singleton caching (_get_llm)
+  │                             Dual LLM backend: ChatOpenAI (openai) or
+  │                             ChatAnthropic (claude) selected via CHAT_PROVIDER
+  │                             LLM singletons cached (_llm, _llm_streaming)
   │                             Async-safe: wraps pipeline in run_in_executor
   │                             Configurable top-k via DOCS_TOP_K/JIRA_TOP_K/
   │                             CONFLUENCE_TOP_K
@@ -441,7 +455,7 @@ QUERY PHASE (runs every time you ask a question):
   │   │                         arcmind_confluence via retrieve_all()
   │   │                         Jira filtered by connector/component if detected
   │   ├── query_expander.py   ← LLM-driven query expansion
-  │   │                         ChatOpenAI singleton (_get_expansion_llm)
+  │   │                         Uses configured LLM (openai or claude)
   │   │                         Generates 5 query variants for broader recall
   │   ├── query_router.py     ← Routes to docs-only, Jira-only, or hybrid
   │   ├── connector_detector.py ← Detects Arc connector/component in queries
@@ -826,9 +840,11 @@ HTTP Response:
 
 Cost: gpt-4.1 — ~$0.002 per 1000 input tokens + $0.008 per 1000 output tokens
       A typical question with 2000 tokens context costs ~$0.005 (~0.5 paise)
+      claude-sonnet-4-5 — ~$0.003 per 1000 input + $0.015 per 1000 output tokens
 
-  Note: gpt-4.1 is also used for query expansion (CHAT_MODEL singleton,
-  ~200 tokens per call).
+  Note: The configured CHAT_MODEL is also used for query expansion (singleton,
+  ~200 tokens per call). OPENAI embeddings are always used regardless of
+  which CHAT_PROVIDER is selected.
 
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -841,8 +857,9 @@ construction, history management, and retrieval logic ourselves.
 
 LangChain components used:
 
-  1. ChatOpenAI
-     Wraps the OpenAI Chat Completions API.
+  1. ChatOpenAI / ChatAnthropic
+     Wraps the OpenAI Chat Completions API (CHAT_PROVIDER=openai) or the
+     Anthropic Messages API (CHAT_PROVIDER=claude).
      Handles: API key, model selection, temperature, streaming, retries.
 
   2. OpenAIEmbeddings
@@ -881,7 +898,7 @@ LangChain components used:
         │
         ▼
   create_history_aware_retriever
-        │ rewrites + expands question using gpt-4.1
+        │ rewrites + expands question using configured LLM
         ▼
   Chroma MMR retriever
         │ returns 30 diverse candidate chunks (TOP_K × 2)
@@ -892,7 +909,8 @@ LangChain components used:
   create_stuff_documents_chain
         │ injects top 8 chunks into strict rules prompt
         ▼
-  ChatOpenAI (gpt-4.1, temperature=0.1)
+  ChatOpenAI / ChatAnthropic (temperature=0.1)
+        │ selected via CHAT_PROVIDER env var
         │ generates grounded answer
         ▼
   {"answer": "...", "context": [8 Document objects]}
@@ -937,6 +955,7 @@ LangChain components used:
     Cross-encoder reranker runs locally (no extra API call).
     Streaming answers via /api/chat/stream for instant first-token response.
     ChatOpenAI and expansion LLM are singletons (no repeated instantiation).
+    ChatAnthropic is used instead when CHAT_PROVIDER=claude.
 
   ✓ CONTEXT-AWARE
     The AI remembers your full conversation.
@@ -1011,7 +1030,7 @@ LangChain components used:
                                                and passed to the LLM prompt.
 
   JIRA_URL           (required for Jira)       Your Atlassian Cloud base URL.
-                                               e.g. https://cdatajira.atlassian.net
+                                               e.g. https://your-org.atlassian.net
 
   JIRA_EMAIL         (required for Jira)       Email address for Jira auth.
 
@@ -1053,6 +1072,9 @@ LangChain components used:
 
   GPT                   Generative Pre-trained Transformer — OpenAI's LLM
                         family (GPT-4, GPT-4o, GPT-4.1)
+
+  Claude                Anthropic's LLM family (claude-haiku, claude-sonnet,
+                        claude-opus). Used via CHAT_PROVIDER=claude.
 
   Token                 A unit of text (~3-4 chars). LLMs process tokens,
                         not words. Costs and limits are measured in tokens.

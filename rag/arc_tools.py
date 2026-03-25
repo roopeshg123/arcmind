@@ -27,6 +27,11 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+try:
+    from langchain_anthropic import ChatAnthropic
+except ImportError:
+    ChatAnthropic = None  # type: ignore
+
 from rag.connector_detector import detect_connector
 from rag.prompt_builder import (
     build_confluence_context,
@@ -42,20 +47,34 @@ load_dotenv()
 
 log = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-CHAT_MODEL     = os.getenv("CHAT_MODEL",     "gpt-4.1")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY",    "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CHAT_PROVIDER     = os.getenv("CHAT_PROVIDER",     "openai").lower()
+CHAT_MODEL        = os.getenv("CHAT_MODEL",        "gpt-4.1")
 
-_llm: ChatOpenAI | None = None
+_llm: Any | None = None
 
 
-def _get_llm() -> ChatOpenAI:
+def _get_llm() -> Any:
     global _llm
     if _llm is None:
-        _llm = ChatOpenAI(
-            model=CHAT_MODEL,
-            openai_api_key=OPENAI_API_KEY,
-            temperature=0.1,
-        )
+        if CHAT_PROVIDER == "claude":
+            if ChatAnthropic is None:
+                raise RuntimeError(
+                    "langchain-anthropic is not installed. "
+                    "Run: pip install langchain-anthropic"
+                )
+            _llm = ChatAnthropic(
+                model=CHAT_MODEL,
+                anthropic_api_key=ANTHROPIC_API_KEY,
+                temperature=0.1,
+            )
+        else:
+            _llm = ChatOpenAI(
+                model=CHAT_MODEL,
+                openai_api_key=OPENAI_API_KEY,
+                temperature=0.1,
+            )
     return _llm
 
 
